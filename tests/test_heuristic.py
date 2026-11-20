@@ -1,6 +1,6 @@
 """Unit and performance tests for HeuristicBot (Hypotheses H01-H12)."""
 
-from openbecca.agents import HeuristicBot
+from openbecca.agents import HeuristicBot, HeuristicConfig
 from openbecca.analysis.benchmark import run_hand_benchmark
 from openbecca.cards import Card, Rank, Suit
 from openbecca.rules import TrickPlay
@@ -117,9 +117,8 @@ def test_h05_plays_defensive_two_to_block_ace() -> None:
     )
     assert bot.choose_card(obs) == Card(Suit.SWORDS, Rank.TWO)
 
-
 def test_h06_counters_opponent_busso_with_three() -> None:
-    bot = HeuristicBot()
+    bot = HeuristicBot(config=HeuristicConfig(h06_counter_busso_with_three=True))
     hand = [Card(Suit.SWORDS, Rank.THREE), Card(Suit.SWORDS, Rank.FIVE)]
     obs = _make_obs(
         hand,
