@@ -20,5 +20,5 @@
 - [ ] **Relax `Busso` constraint for AI**: Allow AI agents to decide autonomously whether obeying partner's `Busso` is optimal (e.g., ignoring it when holding only low cards or facing a certain enemy trump).
 - [ ] **Optional / Tactical Signaling & Bluffing**: Allow choosing silence over `Busso`, configurable *Striscio* thresholds, and optional bluff rules.
 - [ ] **41-Point Macro Match Optimization**: Train/adapt AI to shift strategy based on global match score (e.g., defensive play at 39–38 vs aggressive Cricca/Call-out decisions).
-- [ ] **Pure Reinforcement Learning Environment**: Expose a `Gymnasium`-compatible environment and train self-play neural networks (PyTorch PPO / Deep CFR / AlphaZero-style IS-MCTS + Value/Policy Net).
+- [x] **Pure Reinforcement Learning Environment**: Expose a `Gymnasium`-compatible environment and train self-play neural networks (PyTorch PPO / Deep CFR / AlphaZero-style IS-MCTS + Value/Policy Net).
 - [ ] **Explainable Move Commentary**: Natural-language breakdown of *why* the AI prefers Move A over Move B (e.g., "protects Asso di Coppe", "avoids enemy void in Spade").
