@@ -1,0 +1,4 @@
+### Empirical Ablation Results (10,000 duplicate hands per hypothesis)
+- **Baseline**: `HeuristicBot` beats `RandomBot` **7.481 vs 3.664 pts/hand** (+3.817 edge, 80.5% win rate, 6,571 hands/s on i7-1260P).
+- **Confirmed Winners**: `H01` (+0.374), `H02` (+0.207), `H08` (+0.160), `H04` (+0.065), `H12` (+0.065), `H10` (+0.039).
+- **Disproved Hypothesis**: `H06` (**-0.165 pts/hand**, 47.8% win rate). Jumping up with `Tre` in 2nd seat against an opponent's Case-B `Busso` (and/or returning the suit) flushes out our own `Tre` on a low card and promotes the caller's `Due`. Disabled by default in `HeuristicConfig`.

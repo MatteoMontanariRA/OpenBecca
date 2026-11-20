@@ -4,10 +4,10 @@
 - [x] Repository setup, architecture, and decision logs
 - [x] `cards.py`: 40-card deck, exact strength & integer-thirds scoring, Italian written names
 - [x] `signals.py`: Strict v1 automatic signaling (`Busso > Volo > Striscio`)
-- [ ] `rules.py`: Legal move validation, trick resolution, Cricca & Call-out mechanics
-- [ ] `state.py` & `engine.py`: Imperfect-information `Observation`, full hand/match loop, JSON match logs
-- [ ] `RandomBot` & `HeuristicBot` (encoding Hypotheses H01–H12)
-- [ ] Parallel benchmark runner (`benchmark.py`) utilizing multi-core CPU
+- [x] `rules.py`: Legal move validation, trick resolution, Cricca & Call-out mechanics
+- [x] `state.py` & `engine.py`: Imperfect-information `Observation`, full hand/match loop, JSON match logs
+- [x] `RandomBot` & `HeuristicBot` (encoding Hypotheses H01–H12)
+- [x] Parallel benchmark runner (`benchmark.py`) utilizing multi-core CPU
 
 ## Phase 2: Logic Search Engine ("Stockfish Mode") & Web UI
 - [ ] `ISMCTSBot`: Information Set Monte Carlo Tree Search with belief filtering (respecting voids, `Busso`, `Volo`, `Striscio`, and revealed `Cricca`)
