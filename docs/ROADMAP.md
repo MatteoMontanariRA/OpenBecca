@@ -13,7 +13,7 @@
 - [x] `ISMCTSBot`: Information Set Monte Carlo Tree Search with belief filtering (respecting voids, `Busso`, `Volo`, `Striscio`, and revealed `Cricca`)
 - [x] `evaluator.py`: Move ranking with expected points (EV) and win probability per legal card
 - [x] Custom position/hand editor: input any table state and query the AI for best play
-- [ ] Local Streamlit Web UI (`ui/app.py`): Play 1v3, Watch 4 AI, Analyze, Custom Setup
+- [x] Local Streamlit Web UI (`ui/app.py`): Play 1v3, Watch 4 AI, Analyze, Custom Setup
 - [ ] Ablation report: evaluate Hypotheses H01–H12 against `ISMCTSBot`
 
 ## Phase 3: Advanced Gameplay & Strategic Depth (Future Upgrades)
