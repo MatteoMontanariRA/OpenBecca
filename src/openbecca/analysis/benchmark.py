@@ -10,6 +10,7 @@ from dataclasses import dataclass, replace
 
 from openbecca.agents.base import Agent
 from openbecca.agents.heuristic_bot import HeuristicBot, HeuristicConfig
+from openbecca.agents.ismcts_bot import ISMCTSBot
 from openbecca.agents.random_bot import RandomBot
 from openbecca.cards import Deck
 from openbecca.engine import GameEngine
@@ -38,7 +39,7 @@ class BenchmarkSummary:
             f"  {self.team_b_name} avg pts/hand : {self.team_b_avg_points:.3f}\n"
             f"  Net edge (A - B)         : {self.point_diff:+.3f} pts/hand\n"
             f"  {self.team_a_name} hand win rate: {self.team_a_hand_win_rate * 100:.1f}%\n"
-            f"  Runtime                  : {self.elapsed_seconds:.2f}s ({hands_per_sec:.0f} hands/s)"
+            f"  Runtime                  : {self.elapsed_seconds:.2f}s ({hands_per_sec:.1f} hands/s)"
         )
 
 
@@ -47,16 +48,26 @@ def _make_agent(
     seat: int,
     seed: int,
     config: HeuristicConfig | None = None,
+    simulations: int = 120,
 ) -> Agent:
     if agent_type == "random":
         return RandomBot(name=f"Random-{seat}", seed=seed)
     if agent_type == "heuristic":
         return HeuristicBot(name=f"Heuristic-{seat}", config=config)
+    if agent_type == "ismcts":
+        return ISMCTSBot(
+            name=f"ISMCTS-{seat}",
+            simulations=simulations,
+            trump_simulations=max(16, simulations // 4),
+            seed=seed,
+        )
     raise ValueError(f"Unknown agent_type: {agent_type}")
 
 
 def _run_chunk(
-    args: tuple[str, str, int, int, int, bool, HeuristicConfig | None, HeuristicConfig | None],
+    args: tuple[
+        str, str, int, int, int, bool, HeuristicConfig | None, HeuristicConfig | None, int
+    ],
 ) -> tuple[int, int, int, int]:
     """Worker function executed in parallel across CPU cores."""
     (
@@ -68,6 +79,7 @@ def _run_chunk(
         duplicate,
         config_a,
         config_b,
+        simulations,
     ) = args
 
     deck = Deck(seed=base_seed + chunk_id * 100_003)
@@ -82,10 +94,10 @@ def _run_chunk(
 
         # Run 1: Team A in seats (0, 2), Team B in seats (1, 3)
         agents_1 = [
-            _make_agent(team_a_type, 0, s + 0, config_a),
-            _make_agent(team_b_type, 1, s + 1, config_b),
-            _make_agent(team_a_type, 2, s + 2, config_a),
-            _make_agent(team_b_type, 3, s + 3, config_b),
+            _make_agent(team_a_type, 0, s + 0, config_a, simulations),
+            _make_agent(team_b_type, 1, s + 1, config_b, simulations),
+            _make_agent(team_a_type, 2, s + 2, config_a, simulations),
+            _make_agent(team_b_type, 3, s + 3, config_b, simulations),
         ]
         res1 = GameEngine(agents_1).play_hand(allow_callout=False, dealt_hands=dealt)
         team_a_points += res1.hand_points[0]
@@ -97,10 +109,10 @@ def _run_chunk(
         # Run 2 (duplicate): Swap seats with the exact same cards
         if duplicate:
             agents_2 = [
-                _make_agent(team_b_type, 0, s + 4, config_b),
-                _make_agent(team_a_type, 1, s + 5, config_a),
-                _make_agent(team_b_type, 2, s + 6, config_b),
-                _make_agent(team_a_type, 3, s + 7, config_a),
+                _make_agent(team_b_type, 0, s + 4, config_b, simulations),
+                _make_agent(team_a_type, 1, s + 5, config_a, simulations),
+                _make_agent(team_b_type, 2, s + 6, config_b, simulations),
+                _make_agent(team_a_type, 3, s + 7, config_a, simulations),
             ]
             res2 = GameEngine(agents_2).play_hand(allow_callout=False, dealt_hands=dealt)
             team_a_points += res2.hand_points[1]
@@ -122,6 +134,7 @@ def run_hand_benchmark(
     seed: int = 42,
     config_a: HeuristicConfig | None = None,
     config_b: HeuristicConfig | None = None,
+    simulations: int = 120,
     team_a_name: str | None = None,
     team_b_name: str | None = None,
 ) -> BenchmarkSummary:
@@ -135,7 +148,17 @@ def run_hand_benchmark(
         count = deals_per_worker + (1 if idx < remainder else 0)
         if count > 0:
             tasks.append(
-                (team_a_type, team_b_type, count, seed, idx, duplicate, config_a, config_b)
+                (
+                    team_a_type,
+                    team_b_type,
+                    count,
+                    seed,
+                    idx,
+                    duplicate,
+                    config_a,
+                    config_b,
+                    simulations,
+                )
             )
 
     if num_workers == 1 or len(tasks) == 1:
@@ -165,10 +188,15 @@ def run_hand_benchmark(
     )
 
 
-def run_ablation_study(num_deals: int = 500, workers: int | None = None, seed: int = 42) -> None:
+def run_ablation_study(
+    num_deals: int = 500, workers: int | None = None, seed: int = 42
+) -> None:
     """Disable each hypothesis (H01-H12) one by one against full HeuristicBot."""
     full_cfg = HeuristicConfig()
-    print(f"=== Ablation Study (Full HeuristicBot vs Missing 1 Strategy, {num_deals * 2} duplicate hands each) ===")
+    print(
+        f"=== Ablation Study (Full HeuristicBot vs Missing 1 Strategy, "
+        f"{num_deals * 2} duplicate hands each) ==="
+    )
     for field_name in HeuristicConfig.__dataclass_fields__:
         ablated_cfg = replace(full_cfg, **{field_name: False})
         summary = run_hand_benchmark(
@@ -183,7 +211,11 @@ def run_ablation_study(num_deals: int = 500, workers: int | None = None, seed: i
             team_a_name="Full",
             team_b_name=f"No-{field_name}",
         )
-        verdict = "HELPS" if summary.point_diff > 0.02 else ("HURTS" if summary.point_diff < -0.02 else "NEUTRAL")
+        verdict = (
+            "HELPS"
+            if summary.point_diff > 0.02
+            else ("HURTS" if summary.point_diff < -0.02 else "NEUTRAL")
+        )
         print(
             f"  {field_name:32s} | Full edge: {summary.point_diff:+.3f} pts/hand "
             f"| Win%: {summary.team_a_hand_win_rate * 100:5.1f}% | {verdict}"
@@ -192,25 +224,53 @@ def run_ablation_study(num_deals: int = 500, workers: int | None = None, seed: i
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="OpenBecca parallel bot benchmark.")
-    parser.add_argument("--deals", type=int, default=1000, help="Number of unique deals (x2 if duplicate).")
+    parser.add_argument(
+        "--team-a",
+        choices=["random", "heuristic", "ismcts"],
+        default="heuristic",
+        help="Agent type for Team A (seats 0 & 2).",
+    )
+    parser.add_argument(
+        "--team-b",
+        choices=["random", "heuristic", "ismcts"],
+        default="random",
+        help="Agent type for Team B (seats 1 & 3).",
+    )
+    parser.add_argument(
+        "--deals",
+        type=int,
+        default=1000,
+        help="Number of unique deals (x2 if duplicate).",
+    )
+    parser.add_argument(
+        "--simulations",
+        type=int,
+        default=120,
+        help="IS-MCTS simulations per move when using ismcts.",
+    )
     parser.add_argument("--workers", type=int, default=None, help="CPU worker processes.")
     parser.add_argument("--seed", type=int, default=42, help="Base RNG seed.")
-    parser.add_argument("--ablation", action="store_true", help="Run H01-H12 ablation study.")
+    parser.add_argument(
+        "--ablation", action="store_true", help="Run H01-H12 ablation study."
+    )
     args = parser.parse_args()
 
     summary = run_hand_benchmark(
-        "heuristic",
-        "random",
+        args.team_a,
+        args.team_b,
         num_deals=args.deals,
         duplicate=True,
         workers=args.workers,
         seed=args.seed,
+        simulations=args.simulations,
     )
     print(summary.format_report())
 
     if args.ablation:
         print()
-        run_ablation_study(num_deals=max(200, args.deals // 2), workers=args.workers, seed=args.seed)
+        run_ablation_study(
+            num_deals=max(200, args.deals // 2), workers=args.workers, seed=args.seed
+        )
 
 
 if __name__ == "__main__":

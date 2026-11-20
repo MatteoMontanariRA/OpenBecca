@@ -1,6 +1,12 @@
 """OpenBecca: open-source engine and AI sandbox for Beccacino (Marafone)."""
 
-from openbecca.agents import Agent, HeuristicBot, HeuristicConfig, RandomBot
+from openbecca.agents import Agent, HeuristicBot, HeuristicConfig, ISMCTSBot, RandomBot
+from openbecca.analysis import (
+    MoveEvaluation,
+    PositionAnalysis,
+    build_custom_observation,
+    evaluate_position,
+)
 from openbecca.cards import Card, Deck, Rank, Suit
 from openbecca.engine import GameEngine
 from openbecca.rules import TrickPlay, determine_trick_winner, get_legal_cards
@@ -25,5 +31,10 @@ __all__ = [
     "RandomBot",
     "HeuristicBot",
     "HeuristicConfig",
+    "ISMCTSBot",
     "GameEngine",
+    "MoveEvaluation",
+    "PositionAnalysis",
+    "build_custom_observation",
+    "evaluate_position",
 ]

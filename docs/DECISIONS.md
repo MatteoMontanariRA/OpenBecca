@@ -2,3 +2,4 @@
 - **Baseline**: `HeuristicBot` beats `RandomBot` **7.481 vs 3.664 pts/hand** (+3.817 edge, 80.5% win rate, 6,571 hands/s on i7-1260P).
 - **Confirmed Winners**: `H01` (+0.374), `H02` (+0.207), `H08` (+0.160), `H04` (+0.065), `H12` (+0.065), `H10` (+0.039).
 - **Disproved Hypothesis**: `H06` (**-0.165 pts/hand**, 47.8% win rate). Jumping up with `Tre` in 2nd seat against an opponent's Case-B `Busso` (and/or returning the suit) flushes out our own `Tre` on a low card and promotes the caller's `Due`. Disabled by default in `HeuristicConfig`.
+- **Phase 2 Search Milestone**: `ISMCTSBot` (120 sims/move, belief-filtered SO-ISMCTS) beats `HeuristicBot` **6.060 vs 5.060 pts/hand** (+1.000 net edge, 57.0% win rate across 100 duplicate hands). Position analysis runs 400 simulations in ~0.42s on Intel i7-1260P.
