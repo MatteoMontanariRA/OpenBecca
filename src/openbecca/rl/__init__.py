@@ -1,5 +1,6 @@
-"""Reinforcement Learning (Masked PPO Self-Play) package for OpenBecca."""
+"""Reinforcement Learning (Masked PPO, Expert Iteration & AlphaZero IS-MCTS)."""
 
+from openbecca.rl.expert_iter import ExpertIterConfig, run_expert_iteration
 from openbecca.rl.features import (
     NUM_ACTIONS,
     OBS_DIM,
@@ -9,6 +10,7 @@ from openbecca.rl.features import (
     legal_action_mask,
 )
 from openbecca.rl.network import ActorCriticNet
+from openbecca.rl.neural_mcts import NeuralISMCTSBot
 from openbecca.rl.ppo_bot import PPOBot
 from openbecca.rl.trainer import PPOConfig, train_ppo
 
@@ -21,6 +23,9 @@ __all__ = [
     "encode_observation",
     "ActorCriticNet",
     "PPOBot",
+    "NeuralISMCTSBot",
     "PPOConfig",
     "train_ppo",
+    "ExpertIterConfig",
+    "run_expert_iteration",
 ]

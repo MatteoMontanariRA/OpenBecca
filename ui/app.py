@@ -1,7 +1,7 @@
 """OpenBecca local web interface built with Streamlit.
 
 Provides three modes:
-1. Play (1 Human vs 3 AI) with live Stockfish-style move hints & Call-out.
+1. Play (1 Human vs 3 AI) with live Stockfish/AlphaZero move hints & Call-out.
 2. Watch 4 AI (spectator replay with all 4 hands revealed).
 3. Stockfish Studio (manual position setup & expected-value move ranking).
 """
@@ -10,18 +10,20 @@ from __future__ import annotations
 
 import json
 import random
+import time
 from collections import Counter
+from pathlib import Path
 from typing import Any
 
 import streamlit as st
 
 from openbecca.agents import Agent, HeuristicBot, ISMCTSBot, RandomBot
+from openbecca.agents.ismcts_bot import MoveStats
 from openbecca.analysis.evaluator import (
-    PositionAnalysis,
     build_custom_observation,
     evaluate_position,
 )
-from openbecca.cards import ALL_CARDS, Card, Deck, Rank, Suit
+from openbecca.cards import ALL_CARDS, Card, Deck, Suit
 from openbecca.engine import GameEngine
 from openbecca.rules import (
     CRICCA_BONUS_THIRDS,
@@ -48,12 +50,8 @@ SUIT_ICONS: dict[Suit, str] = {
     Suit.CLUBS: "🪵",
 }
 
-SEAT_LABELS: dict[int, str] = {
-    0: "Player 0 (You - Team 0)",
-    1: "Player 1 (Right Opponent - Team 1)",
-    2: "Player 2 (Partner - Team 0)",
-    3: "Player 3 (Left Opponent - Team 1)",
-}
+CHECKPOINT_DIR = Path("checkpoints")
+PREFERRED_CHECKPOINTS = ("az_gen1_sharp.pt", "az_gen1.pt", "ppo_best.pt", "ppo_latest.pt")
 
 
 def card_badge(card: Card) -> str:
@@ -65,7 +63,41 @@ def suit_badge(suit: Suit) -> str:
     return f"{SUIT_ICONS[suit]} {suit.italian_name}"
 
 
-def create_bot(bot_type: str, seat: int, simulations: int, seed: int | None = None) -> Agent:
+def discover_checkpoints() -> list[str]:
+    """Scan checkpoints/ for saved PyTorch models, ordered by preference."""
+    if not CHECKPOINT_DIR.exists():
+        return []
+    found = [p for p in CHECKPOINT_DIR.glob("*.pt") if p.is_file()]
+    pref_rank = {name: i for i, name in enumerate(PREFERRED_CHECKPOINTS)}
+    found.sort(key=lambda p: (pref_rank.get(p.name, 99), p.name))
+    return [str(p) for p in found]
+
+
+@st.cache_resource
+def load_cached_neural_model(checkpoint_path: str) -> Any:
+    """Load ActorCriticNet once per checkpoint path across Streamlit reruns."""
+    import torch
+    from openbecca.rl.ppo_bot import PPOBot
+
+    torch.set_num_threads(2)
+    return PPOBot.load_model(checkpoint_path)
+
+
+def available_bot_types(has_checkpoint: bool) -> list[str]:
+    if has_checkpoint:
+        return ["AlphaZero", "ISMCTSBot", "PPOBot", "HeuristicBot", "RandomBot"]
+    return ["ISMCTSBot", "HeuristicBot", "RandomBot"]
+
+
+def create_bot(
+    bot_type: str,
+    seat: int,
+    simulations: int,
+    seed: int | None = None,
+    *,
+    checkpoint_path: str | None = None,
+    rollout_weight: float = 1.0,
+) -> Agent:
     if bot_type == "RandomBot":
         return RandomBot(name=f"Random-{seat}", seed=seed)
     if bot_type == "HeuristicBot":
@@ -77,24 +109,85 @@ def create_bot(bot_type: str, seat: int, simulations: int, seed: int | None = No
             trump_simulations=max(16, simulations // 4),
             seed=seed,
         )
+    if bot_type == "PPOBot":
+        from openbecca.rl.ppo_bot import PPOBot
+
+        model = load_cached_neural_model(checkpoint_path) if checkpoint_path else None
+        return PPOBot(name=f"PPO-{seat}", model=model, deterministic=True)
+    if bot_type == "AlphaZero":
+        from openbecca.rl.neural_mcts import NeuralISMCTSBot
+
+        model = load_cached_neural_model(checkpoint_path) if checkpoint_path else None
+        return NeuralISMCTSBot(
+            name=f"AlphaZero-{seat}",
+            model=model,
+            simulations=simulations,
+            trump_simulations=max(16, simulations // 4),
+            rollout_weight=rollout_weight,
+            seed=seed,
+        )
     raise ValueError(f"Unknown bot type: {bot_type}")
 
 
-def render_analysis_panel(analysis: PositionAnalysis) -> None:
-    """Display Stockfish-style move ranking table and visual margin chart."""
-    st.caption(
-        f"Analyzed {analysis.total_simulations} simulations in "
-        f"{analysis.elapsed_seconds:.2f}s | Trump: {suit_badge(analysis.trump_suit)} | "
-        f"Trick {analysis.trick_number}/10"
-    )
-    best = analysis.best_move
-    st.success(
-        f"Best move: **{card_badge(best.card)}** "
-        f"(Expected: **{best.expected_points:.2f} pts**, "
-        f"Margin: **{best.expected_margin:+.2f}**, "
-        f"Win%: **{best.win_probability * 100:.1f}%**)"
-    )
+def run_position_analysis(
+    obs: Observation,
+    *,
+    engine: str,
+    simulations: int,
+    checkpoint_path: str | None,
+    rollout_weight: float,
+) -> dict[str, Any]:
+    """Run either classic ISMCTSBot or AlphaZero analysis and return a unified dict."""
+    if engine == "AlphaZero" and checkpoint_path is not None:
+        from openbecca.rl.neural_mcts import NeuralISMCTSBot
+        from openbecca.rl.ppo_bot import PPOBot
 
+        model = load_cached_neural_model(checkpoint_path)
+        t0 = time.perf_counter()
+        nn_priors, _ = PPOBot(model=model).predict_move_probabilities(obs)
+        bot = NeuralISMCTSBot(
+            model=model,
+            simulations=simulations,
+            rollout_weight=rollout_weight,
+        )
+        n_legal = max(1, len(obs.legal_cards))
+        min_v = max(1, min(4, simulations // (n_legal * 3)))
+        stats: list[MoveStats] = bot.analyze_moves(
+            obs, simulations=simulations, min_visits_per_move=min_v
+        )
+        elapsed = time.perf_counter() - t0
+        best_margin = stats[0].expected_margin
+
+        rows = [
+            {
+                "Rank": idx,
+                "Card": card_badge(s.card),
+                "EV Pts": round(s.expected_points, 2),
+                "Opp EV": round(s.expected_opp_points, 2),
+                "Margin": round(s.expected_margin, 2),
+                "Loss vs Best": round(s.expected_margin - best_margin, 2),
+                "Win %": f"{s.win_probability * 100:.1f}%",
+                "NN Prior %": f"{nn_priors.get(s.card, 0.0) * 100:.1f}%",
+                "Sims": s.visits,
+            }
+            for idx, s in enumerate(stats, start=1)
+        ]
+        return {
+            "engine_label": f"AlphaZero ({Path(checkpoint_path).name}, w={rollout_weight:.1f})",
+            "total_simulations": simulations,
+            "elapsed_seconds": elapsed,
+            "trump_suit": obs.trump_suit,
+            "trick_number": obs.current_trick_number,
+            "best_card": stats[0].card,
+            "best_ev": stats[0].expected_points,
+            "best_margin": stats[0].expected_margin,
+            "best_win": stats[0].win_probability,
+            "rows": rows,
+            "chart_data": {s.card.italian_name: round(s.expected_margin, 2) for s in stats},
+        }
+
+    analysis = evaluate_position(obs, simulations=simulations)
+    best = analysis.best_move
     rows = [
         {
             "Rank": idx,
@@ -108,13 +201,39 @@ def render_analysis_panel(analysis: PositionAnalysis) -> None:
         }
         for idx, ev in enumerate(analysis.evaluations, start=1)
     ]
-    st.dataframe(rows, use_container_width=True, hide_index=True)
-
-    chart_data = {
-        ev.card.italian_name: round(ev.expected_margin, 2)
-        for ev in analysis.evaluations
+    return {
+        "engine_label": "ISMCTSBot (Classic)",
+        "total_simulations": analysis.total_simulations,
+        "elapsed_seconds": analysis.elapsed_seconds,
+        "trump_suit": analysis.trump_suit,
+        "trick_number": analysis.trick_number,
+        "best_card": best.card,
+        "best_ev": best.expected_points,
+        "best_margin": best.expected_margin,
+        "best_win": best.win_probability,
+        "rows": rows,
+        "chart_data": {
+            ev.card.italian_name: round(ev.expected_margin, 2)
+            for ev in analysis.evaluations
+        },
     }
-    st.bar_chart(chart_data, height=220)
+
+
+def render_analysis_panel(result: dict[str, Any]) -> None:
+    """Display Stockfish/AlphaZero move ranking table and visual margin chart."""
+    st.caption(
+        f"Engine: **{result['engine_label']}** | "
+        f"{result['total_simulations']} simulations in {result['elapsed_seconds']:.2f}s | "
+        f"Trump: {suit_badge(result['trump_suit'])} | Trick {result['trick_number']}/10"
+    )
+    st.success(
+        f"Best move: **{card_badge(result['best_card'])}** "
+        f"(Expected: **{result['best_ev']:.2f} pts**, "
+        f"Margin: **{result['best_margin']:+.2f}**, "
+        f"Win%: **{result['best_win'] * 100:.1f}%**)"
+    )
+    st.dataframe(result["rows"], use_container_width=True, hide_index=True)
+    st.bar_chart(result["chart_data"], height=220)
 
 
 # ======================================================================
@@ -126,12 +245,35 @@ def _init_play_match(
     ai_sims: int,
     target_score: int,
     seed: int | None,
+    checkpoint_path: str | None,
+    rollout_weight: float,
 ) -> None:
     rng = random.Random(seed)
     agents: dict[int, Agent] = {
-        1: create_bot(opp_type, 1, ai_sims, seed=rng.randint(1, 100_000)),
-        2: create_bot(partner_type, 2, ai_sims, seed=rng.randint(1, 100_000)),
-        3: create_bot(opp_type, 3, ai_sims, seed=rng.randint(1, 100_000)),
+        1: create_bot(
+            opp_type,
+            1,
+            ai_sims,
+            seed=rng.randint(1, 100_000),
+            checkpoint_path=checkpoint_path,
+            rollout_weight=rollout_weight,
+        ),
+        2: create_bot(
+            partner_type,
+            2,
+            ai_sims,
+            seed=rng.randint(1, 100_000),
+            checkpoint_path=checkpoint_path,
+            rollout_weight=rollout_weight,
+        ),
+        3: create_bot(
+            opp_type,
+            3,
+            ai_sims,
+            seed=rng.randint(1, 100_000),
+            checkpoint_path=checkpoint_path,
+            rollout_weight=rollout_weight,
+        ),
     }
     st.session_state.play = {
         "agents": agents,
@@ -225,7 +367,6 @@ def _after_cricca_phase() -> None:
     p = st.session_state.play
     state: HandState = p["state"]
 
-    # Check if any AI wants to call out right after Cricca
     if not p["in_sudden_death"]:
         for offset in range(4):
             pid = (state.trump_caller + offset) % 4
@@ -366,7 +507,7 @@ def _advance_until_human_or_pause() -> None:
     while p["phase"] == "PLAY_TRICK":
         pid = _current_player(state)
         if pid == 0:
-            return  # Wait for human click
+            return
         agent = p["agents"][pid]
         legal = _legal_for_player(
             state, pid, enforce_busso=agent.enforce_busso_constraints
@@ -380,7 +521,6 @@ def _continue_after_trick_pause() -> None:
     p = st.session_state.play
     state: HandState = p["state"]
 
-    # Check if any AI calls out at the end of the completed trick
     if not p["in_sudden_death"]:
         for offset in range(4):
             pid = (state.current_trick_leader + offset) % 4
@@ -441,24 +581,23 @@ def _finalize_completed_hand() -> None:
         p["phase"] = "HAND_OVER"
 
 
-def render_play_mode() -> None:
+def render_play_mode(checkpoint_path: str | None, rollout_weight: float) -> None:
     st.header("Play Beccacino (1 Human + 3 AI)")
+    bot_options = available_bot_types(checkpoint_path is not None)
 
     with st.sidebar:
         st.subheader("Match Settings")
-        partner_type = st.selectbox(
-            "Partner AI (Player 2)", ["HeuristicBot", "ISMCTSBot", "RandomBot"], index=0
-        )
-        opp_type = st.selectbox(
-            "Opponents AI (Players 1 & 3)",
-            ["HeuristicBot", "ISMCTSBot", "RandomBot"],
-            index=0,
-        )
+        partner_type = st.selectbox("Partner AI (Player 2)", bot_options, index=0)
+        opp_type = st.selectbox("Opponents AI (Players 1 & 3)", bot_options, index=0)
         ai_sims = st.slider(
-            "ISMCTSBot simulations/move", min_value=40, max_value=400, value=120, step=20
+            "MCTS simulations/move", min_value=40, max_value=400, value=120, step=20
         )
+        hint_engine_opts = (
+            ["AlphaZero", "ISMCTSBot"] if checkpoint_path is not None else ["ISMCTSBot"]
+        )
+        hint_engine = st.selectbox("Hint Analyzer Engine", hint_engine_opts, index=0)
         hint_sims = st.slider(
-            "Stockfish Hint simulations", min_value=100, max_value=1000, value=400, step=50
+            "Hint simulations", min_value=100, max_value=1000, value=300, step=50
         )
         target_score = st.number_input(
             "Target Score", min_value=11, max_value=61, value=DEFAULT_TARGET_SCORE, step=10
@@ -466,11 +605,27 @@ def render_play_mode() -> None:
         seed_input = st.text_input("Optional Seed (blank = random)", value="")
         if st.button("Start New Match", type="primary", use_container_width=True):
             parsed_seed = int(seed_input.strip()) if seed_input.strip().isdigit() else None
-            _init_play_match(partner_type, opp_type, ai_sims, int(target_score), parsed_seed)
+            _init_play_match(
+                partner_type,
+                opp_type,
+                ai_sims,
+                int(target_score),
+                parsed_seed,
+                checkpoint_path,
+                rollout_weight,
+            )
             st.rerun()
 
     if "play" not in st.session_state:
-        _init_play_match(partner_type, opp_type, ai_sims, int(target_score), None)
+        _init_play_match(
+            partner_type,
+            opp_type,
+            ai_sims,
+            int(target_score),
+            None,
+            checkpoint_path,
+            rollout_weight,
+        )
 
     p = st.session_state.play
     state: HandState = p["state"]
@@ -512,7 +667,9 @@ def render_play_mode() -> None:
         st.subheader("Choose Trump Suit")
         cols = st.columns(4)
         for idx, suit in enumerate(Suit):
-            if cols[idx].button(suit_badge(suit), use_container_width=True, key=f"trump_{suit.name}"):
+            if cols[idx].button(
+                suit_badge(suit), use_container_width=True, key=f"trump_{suit.name}"
+            ):
                 state.trump_suit = suit
                 p["status_banner"] = f"You called trump: {suit_badge(suit)}."
                 _run_cricca_phase()
@@ -536,7 +693,7 @@ def render_play_mode() -> None:
             st.rerun()
         return
 
-    # Table Display (either current trick in progress or just-completed trick)
+    # Table Display
     st.subheader("Table")
     if p["phase"] == "TRICK_COMPLETE" and p["last_trick"] is not None:
         rec: TrickRecord = p["last_trick"]
@@ -574,7 +731,6 @@ def render_play_mode() -> None:
         else:
             st.write("Table is empty — **you lead this trick!**")
 
-        # Allow early call-out right before Trick 1 starts (e.g., 39 pts + Cricca)
         if (
             not p["in_sudden_death"]
             and len(state.completed_tricks) == 0
@@ -584,7 +740,6 @@ def render_play_mode() -> None:
                 _resolve_callout(calling_team=0)
                 st.rerun()
 
-        # Human hand & legal moves
         st.subheader("Your Hand (Click a Legal Card to Play)")
         legal = _legal_for_player(state, 0, enforce_busso=False)
         legal_set = set(legal)
@@ -607,15 +762,21 @@ def render_play_mode() -> None:
                         _advance_until_human_or_pause()
                     st.rerun()
 
-        # Stockfish Hint Box
         st.divider()
-        col_h1, col_h2 = st.columns([1, 2])
+        col_h1, _ = st.columns([1, 2])
         if col_h1.button(
-            f"Analyze Best Move ({hint_sims} sims)", use_container_width=True
+            f"Analyze Best Move ({hint_engine}, {hint_sims} sims)",
+            use_container_width=True,
         ):
             obs = state.build_observation(0, legal_cards=tuple(legal))
-            with st.spinner("Running OpenBecca IS-MCTS search..."):
-                p["hint"] = evaluate_position(obs, simulations=hint_sims)
+            with st.spinner(f"Running OpenBecca {hint_engine} search..."):
+                p["hint"] = run_position_analysis(
+                    obs,
+                    engine=hint_engine,
+                    simulations=hint_sims,
+                    checkpoint_path=checkpoint_path,
+                    rollout_weight=rollout_weight,
+                )
         if p["hint"] is not None:
             render_analysis_panel(p["hint"])
 
@@ -659,7 +820,6 @@ def render_play_mode() -> None:
             mime="application/json",
         )
 
-    # Expandable Trick History
     if state.completed_tricks:
         with st.expander(f"Completed Tricks Log ({len(state.completed_tricks)}/10)"):
             rows = []
@@ -683,23 +843,53 @@ def render_play_mode() -> None:
 # ======================================================================
 # MODE 2: WATCH 4 AI
 # ======================================================================
-def render_watch_mode() -> None:
+def render_watch_mode(checkpoint_path: str | None, rollout_weight: float) -> None:
     st.header("Watch 4 AI Simulation (Spectator Mode)")
+    bot_options = available_bot_types(checkpoint_path is not None)
 
     col1, col2, col3, col4 = st.columns(4)
-    team0_type = col1.selectbox("Team 0 (P0 & P2)", ["ISMCTSBot", "HeuristicBot", "RandomBot"], index=0)
-    team1_type = col2.selectbox("Team 1 (P1 & P3)", ["HeuristicBot", "ISMCTSBot", "RandomBot"], index=0)
-    sims = col3.slider("ISMCTS Simulations", 40, 300, 100, 20, key="watch_sims")
+    team0_type = col1.selectbox("Team 0 (P0 & P2)", bot_options, index=0)
+    team1_default = 1 if len(bot_options) > 1 else 0
+    team1_type = col2.selectbox("Team 1 (P1 & P3)", bot_options, index=team1_default)
+    sims = col3.slider("MCTS Simulations", 40, 300, 120, 20, key="watch_sims")
     seed_val = col4.number_input("Deal Seed", min_value=0, max_value=999_999, value=42)
 
     if st.button("Simulate Hand", type="primary"):
         deck = Deck(seed=int(seed_val))
         dealt = deck.deal()
         agents = [
-            create_bot(team0_type, 0, sims, seed=int(seed_val) + 1),
-            create_bot(team1_type, 1, sims, seed=int(seed_val) + 2),
-            create_bot(team0_type, 2, sims, seed=int(seed_val) + 3),
-            create_bot(team1_type, 3, sims, seed=int(seed_val) + 4),
+            create_bot(
+                team0_type,
+                0,
+                sims,
+                seed=int(seed_val) + 1,
+                checkpoint_path=checkpoint_path,
+                rollout_weight=rollout_weight,
+            ),
+            create_bot(
+                team1_type,
+                1,
+                sims,
+                seed=int(seed_val) + 2,
+                checkpoint_path=checkpoint_path,
+                rollout_weight=rollout_weight,
+            ),
+            create_bot(
+                team0_type,
+                2,
+                sims,
+                seed=int(seed_val) + 3,
+                checkpoint_path=checkpoint_path,
+                rollout_weight=rollout_weight,
+            ),
+            create_bot(
+                team1_type,
+                3,
+                sims,
+                seed=int(seed_val) + 4,
+                checkpoint_path=checkpoint_path,
+                rollout_weight=rollout_weight,
+            ),
         ]
         with st.spinner("Simulating 4-AI hand..."):
             res = GameEngine(agents).play_hand(allow_callout=False, dealt_hands=dealt)
@@ -761,11 +951,11 @@ def render_watch_mode() -> None:
 # ======================================================================
 # MODE 3: STOCKFISH STUDIO (CUSTOM POSITION ANALYZER)
 # ======================================================================
-def render_studio_mode() -> None:
+def render_studio_mode(checkpoint_path: str | None, rollout_weight: float) -> None:
     st.header("Stockfish Studio — Custom Position Analyzer")
     st.write(
-        "Set up any table scenario manually and ask **OpenBecca** for the expected points "
-        "and win probability of every legal move."
+        "Set up any table scenario manually and ask **OpenBecca** (AlphaZero or ISMCTSBot) "
+        "for the expected points and win probability of every legal move."
     )
 
     all_sorted = sorted(ALL_CARDS, key=lambda c: c.sort_key())
@@ -786,7 +976,6 @@ def render_studio_mode() -> None:
     )
     cricca_by = None if cricca_choice == "None" else int(cricca_choice.split()[-1])
 
-    # Step 1: Select player's hand
     default_hand = [card_badge(c) for c in Deck(seed=42).deal()[0]]
     selected_hand_labels = st.multiselect(
         "1. Your Hand (select 1 to 10 cards)",
@@ -797,7 +986,6 @@ def render_studio_mode() -> None:
     )
     player_hand = [label_to_card[lbl] for lbl in selected_hand_labels]
 
-    # Step 2: Select cards currently on the table (in play order)
     remaining_after_hand = [lbl for lbl in all_labels if lbl not in selected_hand_labels]
     table_labels = st.multiselect(
         "2. Cards Currently on the Table (0 to 3 cards, in order played)",
@@ -818,7 +1006,6 @@ def render_studio_mode() -> None:
             key="studio_signal",
         )
 
-    # Step 3: Previously played cards from earlier tricks
     needed_past = (10 - len(player_hand)) * 4
     remaining_for_past = [
         lbl for lbl in remaining_after_hand if lbl not in table_labels
@@ -845,11 +1032,14 @@ def render_studio_mode() -> None:
             key="studio_autofill",
         )
 
-    sims = st.slider(
-        "Analysis Depth (IS-MCTS Simulations)",
+    col_e1, col_e2 = st.columns([1, 2])
+    engine_opts = ["AlphaZero", "ISMCTSBot"] if checkpoint_path is not None else ["ISMCTSBot"]
+    studio_engine = col_e1.selectbox("Analyzer Engine", engine_opts, index=0, key="studio_engine")
+    sims = col_e2.slider(
+        "Analysis Depth (Simulations)",
         min_value=100,
-        max_value=1500,
-        value=500,
+        max_value=1200,
+        value=400,
         step=50,
         key="studio_sims",
     )
@@ -872,7 +1062,6 @@ def render_studio_mode() -> None:
                 )
                 return
 
-        # Assign table players in exact counter-clockwise order ending right before player_id
         leader = (player_id - len(table_cards)) % 4
         current_trick = [
             TrickPlay(player=(leader + idx) % 4, card=card)
@@ -895,9 +1084,15 @@ def render_studio_mode() -> None:
             st.error(str(exc))
             return
 
-        with st.spinner(f"Running {sims} IS-MCTS simulations..."):
-            analysis = evaluate_position(obs, simulations=sims)
-        render_analysis_panel(analysis)
+        with st.spinner(f"Running {sims} {studio_engine} simulations..."):
+            result = run_position_analysis(
+                obs,
+                engine=studio_engine,
+                simulations=sims,
+                checkpoint_path=checkpoint_path,
+                rollout_weight=rollout_weight,
+            )
+        render_analysis_panel(result)
 
 
 # ======================================================================
@@ -921,12 +1116,35 @@ def main() -> None:
         ],
     )
 
-    if mode == "Play (1 Human + 3 AI)":
-        render_play_mode()
-    elif mode == "Watch 4 AI":
-        render_watch_mode()
+    st.sidebar.divider()
+    st.sidebar.subheader("Neural Model (RL / AlphaZero)")
+    ckpts = discover_checkpoints()
+    if ckpts:
+        checkpoint_path: str | None = st.sidebar.selectbox(
+            "Checkpoint (.pt)",
+            options=ckpts,
+            index=0,
+            format_func=lambda p: Path(p).name,
+        )
+        rollout_weight = st.sidebar.slider(
+            "AlphaZero rollout weight",
+            min_value=0.0,
+            max_value=1.0,
+            value=1.0,
+            step=0.1,
+            help="1.0 = Policy Prior + full rollout (strongest); 0.0 = pure neural value.",
+        )
     else:
-        render_studio_mode()
+        checkpoint_path = None
+        rollout_weight = 1.0
+        st.sidebar.warning("No checkpoints found in `checkpoints/`. Neural bots disabled.")
+
+    if mode == "Play (1 Human + 3 AI)":
+        render_play_mode(checkpoint_path, rollout_weight)
+    elif mode == "Watch 4 AI":
+        render_watch_mode(checkpoint_path, rollout_weight)
+    else:
+        render_studio_mode(checkpoint_path, rollout_weight)
 
 
 if __name__ == "__main__":

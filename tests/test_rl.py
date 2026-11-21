@@ -11,13 +11,16 @@ from openbecca.engine import GameEngine
 from openbecca.rl import (
     NUM_ACTIONS,
     OBS_DIM,
+    NeuralISMCTSBot,
     PPOBot,
     PPOConfig,
+    ExpertIterConfig,
     card_to_index,
     encode_observation,
     index_to_card,
     legal_action_mask,
     train_ppo,
+    run_expert_iteration,
 )
 
 
@@ -69,3 +72,47 @@ def test_ppo_bot_plays_legal_hand_and_saves_loads_checkpoint(tmp_path: Path) -> 
     assert len(res.tricks) == 10
     expected_total = 14 if res.cricca_declared_by is not None else 11
     assert sum(res.hand_points) == expected_total
+
+def test_neural_ismcts_bot_pure_and_hybrid_legal_play() -> None:
+    for weight in (0.0, 0.5):
+        agents = [
+            NeuralISMCTSBot(
+                "AZ-0", simulations=20, trump_simulations=6, rollout_weight=weight, seed=1
+            ),
+            HeuristicBot("H-1"),
+            NeuralISMCTSBot(
+                "AZ-2", simulations=20, trump_simulations=6, rollout_weight=weight, seed=2
+            ),
+            HeuristicBot("H-3"),
+        ]
+        res = GameEngine(agents, seed=19).play_hand(allow_callout=False)
+        assert len(res.tricks) == 10
+        expected_total = 14 if res.cricca_declared_by is not None else 11
+        assert sum(res.hand_points) == expected_total
+
+def test_expert_iteration_generates_distills_and_loads(tmp_path: Path) -> None:
+    out_ckpt = tmp_path / "az_test.pt"
+    out_data = tmp_path / "data.npz"
+    cfg = ExpertIterConfig(
+        teacher="ismcts",
+        output_checkpoint=str(out_ckpt),
+        dataset_path=str(out_data),
+        num_hands=3,
+        simulations=16,
+        hidden_dim=64,
+        epochs=2,
+        batch_size=16,
+        eval_deals=0,
+        workers=1,
+        seed=13,
+    )
+    saved = run_expert_iteration(cfg, verbose=False)
+    assert saved.exists()
+    assert out_data.exists()
+
+    bot = PPOBot("ExIt-0", checkpoint_path=saved, deterministic=True)
+    res = GameEngine(
+        [bot, HeuristicBot("H-1"), PPOBot("ExIt-2", model=bot.model), HeuristicBot("H-3")],
+        seed=5,
+    ).play_hand(allow_callout=False)
+    assert len(res.tricks) == 10
