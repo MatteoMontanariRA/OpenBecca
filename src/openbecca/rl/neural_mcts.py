@@ -1,4 +1,10 @@
-"""AlphaZero-style Neural IS-MCTS (PUCT + Policy Prior + Value Leaf Evaluation)."""
+"""AlphaZero-style Neural IS-MCTS (PUCT + Policy Prior + Value Leaf Evaluation).
+
+CPU-optimized with:
+- Zero-overhead NumPy single-sample inference (_FastNumpyNet).
+- Delayed internal node expansion (expand_after_visits) when rollout_weight=1.0.
+- Automatic bypass of neural inference on forced 1-card moves.
+"""
 
 from __future__ import annotations
 
@@ -8,7 +14,6 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 import numpy as np
-import torch
 
 from openbecca.agents.base import Agent
 from openbecca.agents.ismcts_bot import (
@@ -33,6 +38,70 @@ from openbecca.rules import (
 )
 from openbecca.signals import Signal
 from openbecca.state import Observation
+
+
+class _FastNumpyNet:
+    """Zero-overhead NumPy forward pass matching ActorCriticNet for batch=1 CPU inference."""
+
+    def __init__(self, model: ActorCriticNet) -> None:
+        fc1 = model.trunk[0]
+        ln1 = model.trunk[1]
+        fc2 = model.trunk[3]
+        ln2 = model.trunk[4]
+
+        self.w1 = fc1.weight.detach().cpu().numpy().astype(np.float32, copy=True)
+        self.b1 = fc1.bias.detach().cpu().numpy().astype(np.float32, copy=True)
+        self.ln1_w = ln1.weight.detach().cpu().numpy().astype(np.float32, copy=True)
+        self.ln1_b = ln1.bias.detach().cpu().numpy().astype(np.float32, copy=True)
+        self.ln1_eps = float(ln1.eps)
+
+        self.w2 = fc2.weight.detach().cpu().numpy().astype(np.float32, copy=True)
+        self.b2 = fc2.bias.detach().cpu().numpy().astype(np.float32, copy=True)
+        self.ln2_w = ln2.weight.detach().cpu().numpy().astype(np.float32, copy=True)
+        self.ln2_b = ln2.bias.detach().cpu().numpy().astype(np.float32, copy=True)
+        self.ln2_eps = float(ln2.eps)
+
+        self.wp = model.policy_head.weight.detach().cpu().numpy().astype(np.float32, copy=True)
+        self.bp = model.policy_head.bias.detach().cpu().numpy().astype(np.float32, copy=True)
+        self.wv = (
+            model.value_head.weight.detach()
+            .cpu()
+            .numpy()
+            .reshape(-1)
+            .astype(np.float32, copy=True)
+        )
+        self.bv = float(model.value_head.bias.detach().cpu().item())
+
+    @staticmethod
+    def _layer_norm_silu(
+        x: np.ndarray, weight: np.ndarray, bias: np.ndarray, eps: float
+    ) -> np.ndarray:
+        mean = float(x.mean())
+        diff = x - mean
+        inv_std = 1.0 / math.sqrt(float(np.dot(diff, diff)) / x.size + eps)
+        normed = diff * inv_std * weight + bias
+        clipped = np.clip(normed, -30.0, 30.0)
+        return normed / (1.0 + np.exp(-clipped))
+
+    def predict(
+        self, obs_np: np.ndarray, mask_np: np.ndarray, prior_temp: float
+    ) -> tuple[np.ndarray, float]:
+        """Return (masked softmax probs [40], scalar value) without PyTorch dispatch."""
+        h = self.w1 @ obs_np + self.b1
+        h = self._layer_norm_silu(h, self.ln1_w, self.ln1_b, self.ln1_eps)
+        h = self.w2 @ h + self.b2
+        h = self._layer_norm_silu(h, self.ln2_w, self.ln2_b, self.ln2_eps)
+
+        logits = self.wp @ h + self.bp
+        value = float(np.dot(self.wv, h) + self.bv)
+
+        valid_logits = logits[mask_np] / prior_temp
+        valid_logits = valid_logits - float(valid_logits.max())
+        valid_exps = np.exp(valid_logits)
+
+        probs = np.zeros(logits.shape, dtype=np.float32)
+        probs[mask_np] = (valid_exps / float(valid_exps.sum())).astype(np.float32)
+        return probs, value
 
 
 @dataclass
@@ -69,11 +138,11 @@ class NeuralISMCTSBot(Agent):
 
     Combines:
     - Belief-filtered determinization (respecting voids, Busso, Volo, Striscio, Cricca).
-    - Policy-guided PUCT selection using the neural network's masked softmax priors.
+    - Policy-guided PUCT selection using temperature-scaled neural priors.
     - Configurable leaf evaluation:
-        * rollout_weight = 0.0 -> pure AlphaZero (neural value head only, fastest)
+        * rollout_weight = 1.0 -> policy-guided PUCT + delayed expansion + rollout (default)
         * rollout_weight = 0.5 -> hybrid blend (neural value + heuristic rollout)
-        * rollout_weight = 1.0 -> policy-guided PUCT tree + full heuristic rollout
+        * rollout_weight = 0.0 -> pure neural value head evaluation
     """
 
     def __init__(
@@ -87,6 +156,7 @@ class NeuralISMCTSBot(Agent):
         c_puct: float = 1.25,
         prior_temp: float = 1.5,
         rollout_weight: float = 1.0,
+        expand_after_visits: int = 3,
         seed: int | None = None,
         enforce_busso_constraints: bool = True,
     ) -> None:
@@ -99,6 +169,7 @@ class NeuralISMCTSBot(Agent):
         self.c_puct = c_puct
         self.prior_temp = max(0.1, prior_temp)
         self.rollout_weight = rollout_weight
+        self.expand_after_visits = max(1, expand_after_visits)
         self._rng = random.Random(seed)
 
         if model is not None:
@@ -109,14 +180,13 @@ class NeuralISMCTSBot(Agent):
             self.model = ActorCriticNet()
 
         self.model.eval()
+        self._fast_net = _FastNumpyNet(self.model)
 
-    @torch.no_grad()
     def _evaluate_net(self, obs: Observation) -> tuple[np.ndarray, float]:
-        obs_t = torch.from_numpy(encode_observation(obs)).unsqueeze(0)
-        mask_t = torch.from_numpy(legal_action_mask(obs)).unsqueeze(0)
-        masked_logits, value = self.model.forward(obs_t, mask_t)
-        probs = torch.softmax(masked_logits / self.prior_temp, dim=-1).squeeze(0).numpy()
-        return probs, float(value.item())
+        """Run fast NumPy forward pass returning (action_probs [40], future_margin_norm)."""
+        return self._fast_net.predict(
+            encode_observation(obs), legal_action_mask(obs), self.prior_temp
+        )
 
     def _estimate_leaf_points(
         self, sim: _SimState, v_future_norm: float
@@ -130,7 +200,6 @@ class NeuralISMCTSBot(Agent):
         pid = sim.current_player
         t = team_of(pid)
 
-        # Neural critic predicts remaining non-Cricca margin normalized by 11.0
         curr_margin_pts = (sim.hand_thirds[t] - sim.hand_thirds[1 - t]) / 3.0
         pred_margin = curr_margin_pts + v_future_norm * 11.0
         pred_margin = max(-total_pts, min(total_pts, pred_margin))
@@ -230,7 +299,6 @@ class NeuralISMCTSBot(Agent):
             return obs.legal_cards[0]
 
         stats = self.analyze_moves(obs, simulations=self.simulations)
-        # AlphaZero tournament rule: prefer most visited move, breaking ties by margin.
         best = max(stats, key=lambda s: (s.visits, s.expected_margin))
         return best.card
 
@@ -249,16 +317,21 @@ class NeuralISMCTSBot(Agent):
         root_legal = list(obs.legal_cards)
         constraints = infer_belief_constraints(obs)
 
-        # Single neural forward pass at the root to initialize exact policy priors.
-        root_probs, _ = self._evaluate_net(obs)
         root = _NeuralISNode(is_expanded=True)
-        for card in root_legal:
-            root.children[card] = _NeuralISNode(
-                move=card,
-                parent=root,
-                player_just_moved=obs.player_id,
-                prior=float(root_probs[card_to_index(card)]),
+        if len(root_legal) == 1:
+            only = root_legal[0]
+            root.children[only] = _NeuralISNode(
+                move=only, parent=root, player_just_moved=obs.player_id, prior=1.0
             )
+        else:
+            root_probs, _ = self._evaluate_net(obs)
+            for card in root_legal:
+                root.children[card] = _NeuralISNode(
+                    move=card,
+                    parent=root,
+                    player_just_moved=obs.player_id,
+                    prior=float(root_probs[card_to_index(card)]),
+                )
 
         warmup_total = (
             min(total_sims, len(root_legal) * min_visits_per_move)
@@ -289,7 +362,19 @@ class NeuralISMCTSBot(Agent):
                 pid = sim.current_player
                 legal = sim.legal_moves(enforce_busso=True)
 
-                # Different determinizations can expose a legal card not yet in node.children
+                if len(legal) == 1:
+                    m = legal[0]
+                    child = node.children.get(m)
+                    if child is None:
+                        child = _NeuralISNode(
+                            move=m, parent=node, player_just_moved=pid, prior=1.0
+                        )
+                        node.children[m] = child
+                    child.availability += 1
+                    sim.apply_move(m)
+                    node = child
+                    continue
+
                 missing = [m for m in legal if m not in node.children]
                 if missing:
                     fallback_prior = 1.0 / len(legal)
@@ -320,18 +405,37 @@ class NeuralISMCTSBot(Agent):
             else:
                 pid = sim.current_player
                 legal = sim.legal_moves(enforce_busso=True)
-                sim_obs = sim.to_observation(pid, legal)
-                probs, v_future = self._evaluate_net(sim_obs)
 
-                for m in legal:
+                if len(legal) == 1:
+                    m = legal[0]
                     node.children[m] = _NeuralISNode(
-                        move=m,
-                        parent=node,
-                        player_just_moved=pid,
-                        prior=float(probs[card_to_index(m)]),
+                        move=m, parent=node, player_just_moved=pid, prior=1.0
                     )
-                node.is_expanded = True
-                final_points = self._estimate_leaf_points(sim, v_future)
+                    node.is_expanded = True
+                    if self.rollout_weight >= 1.0:
+                        roll = sim.rollout_to_end()
+                        final_points = (float(roll[0]), float(roll[1]))
+                    else:
+                        _, v_future = self._evaluate_net(sim.to_observation(pid, legal))
+                        final_points = self._estimate_leaf_points(sim, v_future)
+                elif (
+                    self.rollout_weight >= 1.0
+                    and (node.visits + 1) < self.expand_after_visits
+                ):
+                    roll = sim.rollout_to_end()
+                    final_points = (float(roll[0]), float(roll[1]))
+                else:
+                    sim_obs = sim.to_observation(pid, legal)
+                    probs, v_future = self._evaluate_net(sim_obs)
+                    for m in legal:
+                        node.children[m] = _NeuralISNode(
+                            move=m,
+                            parent=node,
+                            player_just_moved=pid,
+                            prior=float(probs[card_to_index(m)]),
+                        )
+                    node.is_expanded = True
+                    final_points = self._estimate_leaf_points(sim, v_future)
 
             # 4. Backpropagation (perspective-aware per team)
             curr: _NeuralISNode | None = node

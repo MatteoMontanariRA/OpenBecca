@@ -116,3 +116,33 @@ def test_expert_iteration_generates_distills_and_loads(tmp_path: Path) -> None:
         seed=5,
     ).play_hand(allow_callout=False)
     assert len(res.tricks) == 10
+
+def test_fast_numpy_net_matches_pytorch_forward() -> None:
+    import torch
+    from openbecca.rl.network import ActorCriticNet
+    from openbecca.rl.neural_mcts import _FastNumpyNet
+
+    torch.manual_seed(99)
+    model = ActorCriticNet(hidden_dim=128)
+    model.eval()
+    fast_net = _FastNumpyNet(model)
+
+    hands = Deck(seed=7).deal()
+    obs = build_custom_observation(
+        player_hand=hands[0], trump_suit=Suit.SWORDS, player_id=0, trump_caller=0
+    )
+    obs_np = encode_observation(obs)
+    mask_np = legal_action_mask(obs)
+    prior_temp = 1.5
+
+    fast_probs, fast_val = fast_net.predict(obs_np, mask_np, prior_temp)
+    with torch.no_grad():
+        logits, val = model.forward(
+            torch.from_numpy(obs_np).unsqueeze(0),
+            torch.from_numpy(mask_np).unsqueeze(0),
+        )
+        torch_probs = torch.softmax(logits / prior_temp, dim=-1).squeeze(0).numpy()
+        torch_val = float(val.item())
+
+    assert np.allclose(fast_probs, torch_probs, atol=1e-5)
+    assert abs(fast_val - torch_val) < 1e-5
