@@ -1,0 +1,637 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<style>
+  * { box-sizing: border-box; user-select: none; }
+  html, body {
+    margin: 0;
+    padding: 0;
+    background: transparent;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    color: #f8f5ec;
+    overflow: hidden;
+  }
+
+  .table-shell {
+    background: radial-gradient(ellipse at center, #1e6b43 0%, #144d30 68%, #0d3520 100%);
+    border: 8px solid #4e2f1a;
+    border-radius: 22px;
+    box-shadow: inset 0 0 42px rgba(0, 0, 0, 0.55), 0 10px 26px rgba(0, 0, 0, 0.35);
+    padding: 10px 14px 14px 14px;
+    display: grid;
+    grid-template-rows: auto 1fr auto;
+    grid-template-columns: 168px 1fr 168px;
+    grid-template-areas:
+      "top top top"
+      "left center right"
+      "bottom bottom bottom";
+    gap: 6px;
+    min-height: 550px;
+    position: relative;
+  }
+
+  .seat-top { grid-area: top; display: flex; flex-direction: column; align-items: center; gap: 5px; }
+  .seat-bottom { grid-area: bottom; display: flex; flex-direction: column; align-items: center; gap: 6px; padding-top: 2px; }
+  .seat-left { grid-area: left; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 6px; }
+  .seat-right { grid-area: right; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 6px; }
+
+  .nameplate {
+    background: rgba(10, 26, 17, 0.84);
+    border: 1.5px solid rgba(255, 255, 255, 0.24);
+    border-radius: 999px;
+    padding: 3px 12px;
+    font-size: 12px;
+    font-weight: 600;
+    letter-spacing: 0.2px;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    white-space: nowrap;
+  }
+  .nameplate.active {
+    border-color: #ffd166;
+    background: rgba(54, 41, 8, 0.94);
+    box-shadow: 0 0 12px rgba(255, 209, 102, 0.55);
+    color: #fff3c4;
+  }
+  .nameplate .count-pill {
+    background: rgba(255, 255, 255, 0.16);
+    border-radius: 999px;
+    padding: 1px 7px;
+    font-size: 11px;
+    color: #e4f0e8;
+  }
+
+  .hand-row {
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    min-height: 70px;
+  }
+
+  /* Non-overlapping bottom hand: zero edge flicker */
+  .hand-row.bottom-hand {
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    gap: 6px;
+    min-height: 146px;
+    padding: 6px 4px 18px 4px;
+    width: 100%;
+  }
+
+  .hand-side {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    min-height: 200px;
+  }
+  .hand-side.face-up {
+    display: grid;
+    grid-template-columns: repeat(2, 50px);
+    gap: 4px;
+    justify-content: center;
+    align-content: center;
+  }
+
+  .card-wrap {
+    position: relative;
+    border-radius: 7px;
+    overflow: visible;
+    flex-shrink: 0;
+  }
+  .card-img {
+    display: block;
+    border-radius: 7px;
+    box-shadow: 0 4px 10px rgba(0, 0, 0, 0.45);
+    background: #f5efe0;
+    object-fit: cover;
+    opacity: 1;
+    pointer-events: none;
+  }
+
+  /* Responsive bottom card size so 10 cards always fit without overlapping */
+  .card-bottom {
+    width: clamp(52px, 7.2vw, 72px);
+    aspect-ratio: 240 / 448;
+    height: auto;
+  }
+
+  .card-top-back { width: 38px; height: 70px; }
+  .card-top-face { width: 50px; height: 93px; }
+  .seat-top .card-wrap + .card-wrap { margin-left: -12px; }
+
+  .card-side-back { width: 48px; height: 88px; transform: rotate(90deg); }
+  .hand-side.backs .card-wrap + .card-wrap { margin-top: -64px; }
+  .card-side-face { width: 48px; height: 90px; }
+
+  /* Rock-solid hover highlight: NO translate/scale movement -> zero flicker */
+  .card-wrap.legal {
+    cursor: pointer;
+  }
+  .card-wrap.legal .card-img {
+    outline: 2px solid rgba(255, 214, 102, 0.85);
+  }
+  .card-wrap.legal:hover .card-img {
+    outline: 3.5px solid #ffd166;
+    box-shadow: 0 0 18px rgba(255, 209, 102, 0.8), 0 8px 18px rgba(0, 0, 0, 0.58);
+    filter: brightness(1.08);
+  }
+  .card-wrap.illegal {
+    cursor: not-allowed;
+  }
+  .card-wrap.illegal .card-img {
+    opacity: 0.42;
+    filter: grayscale(45%) brightness(0.8);
+  }
+
+  .card-tooltip {
+    position: absolute;
+    bottom: -18px;
+    left: 50%;
+    transform: translateX(-50%);
+    background: rgba(0, 0, 0, 0.88);
+    color: #fff;
+    font-size: 10px;
+    padding: 1px 6px;
+    border-radius: 4px;
+    white-space: nowrap;
+    opacity: 0;
+    pointer-events: none;
+    z-index: 40;
+  }
+  .card-wrap:hover .card-tooltip { opacity: 1; }
+
+  /* Center trick arena */
+  .center-arena {
+    grid-area: center;
+    display: grid;
+    grid-template-rows: 1fr auto 1fr;
+    grid-template-columns: 1fr auto 1fr;
+    grid-template-areas:
+      ". slot-top ."
+      "slot-left hub slot-right"
+      ". slot-bottom .";
+    align-items: center;
+    justify-items: center;
+    min-height: 290px;
+    padding: 2px;
+    position: relative;
+  }
+
+  .table-hub {
+    grid-area: hub;
+    background: rgba(9, 28, 17, 0.84);
+    border: 1px solid rgba(255, 255, 255, 0.22);
+    border-radius: 14px;
+    padding: 8px 14px;
+    text-align: center;
+    min-width: 170px;
+    max-width: 280px;
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.35);
+    z-index: 15;
+  }
+  .hub-trump { font-size: 13.5px; font-weight: 700; color: #ffe49e; }
+  .hub-sub { font-size: 11px; color: #cce5d5; margin-top: 2px; }
+  .hub-banner { font-size: 11.5px; color: #fff; margin-top: 4px; font-weight: 600; }
+
+  .hub-actions {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: center;
+    gap: 6px;
+    margin-top: 8px;
+  }
+  .hub-btn {
+    border: 1.5px solid #ffd166;
+    background: linear-gradient(180deg, #ffd166 0%, #e6b33c 100%);
+    color: #1f1604;
+    font-size: 11.5px;
+    font-weight: 800;
+    padding: 5px 10px;
+    border-radius: 8px;
+    cursor: pointer;
+    box-shadow: 0 2px 6px rgba(0, 0, 0, 0.35);
+  }
+  .hub-btn:hover {
+    filter: brightness(1.08);
+  }
+  .hub-btn.secondary {
+    background: rgba(255, 255, 255, 0.12);
+    color: #f8f5ec;
+    border-color: rgba(255, 255, 255, 0.35);
+  }
+
+  .trick-slot {
+    width: 72px;
+    height: 132px;
+    border-radius: 9px;
+    border: 1.5px dashed rgba(255, 255, 255, 0.16);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    position: relative;
+  }
+  .trick-slot.filled { border-color: transparent; }
+  .slot-top { grid-area: slot-top; }
+  .slot-bottom { grid-area: slot-bottom; }
+  .slot-left { grid-area: slot-left; }
+  .slot-right { grid-area: slot-right; }
+
+  .played-card {
+    width: 70px;
+    height: 130px;
+    border-radius: 7px;
+    box-shadow: 0 8px 18px rgba(0, 0, 0, 0.58);
+    opacity: 1 !important;
+  }
+  .trick-slot.winner .played-card {
+    outline: 3.5px solid #ffd166;
+    box-shadow: 0 0 22px rgba(255, 209, 102, 0.85);
+  }
+
+  .signal-badge {
+    position: absolute;
+    top: -12px;
+    left: 50%;
+    transform: translateX(-50%);
+    background: #d62828;
+    color: #fff;
+    font-size: 10px;
+    font-weight: 800;
+    letter-spacing: 0.5px;
+    padding: 2px 8px;
+    border-radius: 999px;
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.45);
+    white-space: nowrap;
+    z-index: 10;
+  }
+  .signal-badge.volo { background: #1d6fa5; }
+  .signal-badge.striscio { background: #b5651d; }
+
+  .winner-badge {
+    position: absolute;
+    bottom: -11px;
+    left: 50%;
+    transform: translateX(-50%);
+    background: #ffd166;
+    color: #241905;
+    font-size: 10px;
+    font-weight: 800;
+    padding: 2px 8px;
+    border-radius: 999px;
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.45);
+    white-space: nowrap;
+    z-index: 10;
+  }
+
+  .fallback-card {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    text-align: center;
+    background: #faf3e0;
+    color: #1f1a17;
+    border: 2px solid #8b6d46;
+    font-size: 10px;
+    font-weight: 700;
+    padding: 4px;
+    line-height: 1.2;
+  }
+</style>
+</head>
+<body>
+<div id="root"></div>
+
+<script>
+  const BACK_SVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 110 206">
+    <defs>
+      <pattern id="romGrid" width="14" height="14" patternUnits="userSpaceOnUse">
+        <rect width="14" height="14" fill="#8b1e24"/>
+        <path d="M7 1 L13 7 L7 13 L1 7 Z" fill="none" stroke="#d4af37" stroke-width="0.9" opacity="0.72"/>
+        <circle cx="7" cy="7" r="1.4" fill="#f3d98b" opacity="0.8"/>
+      </pattern>
+    </defs>
+    <rect x="1" y="1" width="108" height="204" rx="9" fill="#f7f1e1" stroke="#3a2518" stroke-width="2"/>
+    <rect x="7" y="7" width="96" height="192" rx="5" fill="url(#romGrid)" stroke="#d4af37" stroke-width="2"/>
+    <rect x="13" y="13" width="84" height="180" rx="3" fill="none" stroke="#f3d98b" stroke-width="1" stroke-dasharray="3 2"/>
+    <circle cx="55" cy="103" r="22" fill="#6b141a" stroke="#d4af37" stroke-width="2"/>
+    <path d="M55 86 L66 103 L55 120 L44 103 Z" fill="#d4af37" opacity="0.9"/>
+    <circle cx="55" cy="103" r="5" fill="#8b1e24" stroke="#f7f1e1" stroke-width="1.2"/>
+  </svg>`;
+  const CARD_BACK_URI = "data:image/svg+xml;charset=utf-8," + encodeURIComponent(BACK_SVG);
+
+  let clickCounter = 0;
+  let turnLocked = false;
+  let lastTurnToken = null;
+  let lastSentHeight = 0;
+
+  function sendMessage(type, payload) {
+    window.parent.postMessage(
+      Object.assign({ isStreamlitMessage: true, type: type }, payload || {}),
+      "*"
+    );
+  }
+
+  function setFrameHeight() {
+    const shell = document.querySelector(".table-shell");
+    const h = shell ? Math.ceil(shell.getBoundingClientRect().height) + 8 : 570;
+    if (Math.abs(h - lastSentHeight) > 2) {
+      lastSentHeight = h;
+      sendMessage("streamlit:setFrameHeight", { height: Math.max(555, h) });
+    }
+  }
+
+  function emitAction(action, extra, turnToken) {
+    clickCounter += 1;
+    sendMessage("streamlit:setComponentValue", {
+      value: Object.assign(
+        { action: action, seq: Date.now() + "_" + clickCounter, turn_token: turnToken },
+        extra || {}
+      )
+    });
+  }
+
+  function makeCardImg(cardId, label, sizeClass) {
+    const img = document.createElement("img");
+    img.className = "card-img " + sizeClass;
+    img.src = "cards/" + cardId + ".png";
+    img.alt = label || cardId;
+    img.draggable = false;
+    img.onerror = function () {
+      const fb = document.createElement("div");
+      fb.className = "card-img fallback-card " + sizeClass;
+      fb.textContent = label || cardId;
+      img.replaceWith(fb);
+    };
+    return img;
+  }
+
+  function makeBackImg(sizeClass) {
+    const img = document.createElement("img");
+    img.className = "card-img " + sizeClass;
+    img.src = "cards/BACK.png";
+    img.alt = "Card back";
+    img.draggable = false;
+    img.onerror = function () {
+      img.onerror = null;
+      img.src = CARD_BACK_URI;
+    };
+    return img;
+  }
+
+  function formatCardCount(n) {
+    return n + (n === 1 ? " card" : " cards");
+  }
+
+  function buildNameplate(text, cardCount, isActive, extraId) {
+    const el = document.createElement("div");
+    el.className = "nameplate" + (isActive ? " active" : "");
+    const title = document.createElement("span");
+    title.textContent = text;
+    const pill = document.createElement("span");
+    pill.className = "count-pill";
+    if (extraId) pill.id = extraId;
+    pill.textContent = formatCardCount(cardCount);
+    el.appendChild(title);
+    el.appendChild(pill);
+    return el;
+  }
+
+  function renderTable(args) {
+    const root = document.getElementById("root");
+    root.innerHTML = "";
+
+    const turnToken = args.turn_token || "";
+    if (turnToken !== lastTurnToken) {
+      turnLocked = false;
+      lastTurnToken = turnToken;
+    }
+
+    const shell = document.createElement("div");
+    shell.className = "table-shell";
+
+    const hands = args.hands || { "0": [], "1": [], "2": [], "3": [] };
+    const cardCounts = args.card_counts || { "0": 0, "1": 0, "2": 0, "3": 0 };
+    const handVisible = args.hand_visible || { "0": true, "1": false, "2": false, "3": false };
+    const seatNames = args.seat_names || {
+      "0": "You (P0)",
+      "1": "P1 (Right)",
+      "2": "P2 (Partner)",
+      "3": "P3 (Left)"
+    };
+    const legalSet = new Set(args.legal_ids || []);
+    const interactive = Boolean(args.interactive);
+    const activePlayer = args.active_player;
+    const trickPlays = args.trick_plays || [];
+    const trickLeader = args.trick_leader;
+    const trickSignal = args.trick_signal || "";
+    const trickWinner = args.trick_winner;
+    const hubActions = args.hub_actions || [];
+
+    // --- TOP (Player 2) ---
+    const topSeat = document.createElement("div");
+    topSeat.className = "seat-top";
+    topSeat.appendChild(buildNameplate(seatNames["2"], cardCounts["2"], activePlayer === 2));
+    const topHand = document.createElement("div");
+    topHand.className = "hand-row";
+    if (handVisible["2"]) {
+      (hands["2"] || []).forEach((c) => {
+        const w = document.createElement("div");
+        w.className = "card-wrap";
+        w.appendChild(makeCardImg(c.id, c.name, "card-top-face"));
+        const tip = document.createElement("div");
+        tip.className = "card-tooltip";
+        tip.textContent = c.name;
+        w.appendChild(tip);
+        topHand.appendChild(w);
+      });
+    } else {
+      for (let i = 0; i < (cardCounts["2"] || 0); i++) {
+        const w = document.createElement("div");
+        w.className = "card-wrap";
+        w.appendChild(makeBackImg("card-top-back"));
+        topHand.appendChild(w);
+      }
+    }
+    topSeat.appendChild(topHand);
+    shell.appendChild(topSeat);
+
+    // --- LEFT (Player 3) & RIGHT (Player 1) ---
+    [
+      { pid: 3, cls: "seat-left" },
+      { pid: 1, cls: "seat-right" }
+    ].forEach(({ pid, cls }) => {
+      const seat = document.createElement("div");
+      seat.className = cls;
+      seat.appendChild(buildNameplate(seatNames[String(pid)], cardCounts[String(pid)], activePlayer === pid));
+      const hDiv = document.createElement("div");
+      if (handVisible[String(pid)]) {
+        hDiv.className = "hand-side face-up";
+        (hands[String(pid)] || []).forEach((c) => {
+          const w = document.createElement("div");
+          w.className = "card-wrap";
+          w.appendChild(makeCardImg(c.id, c.name, "card-side-face"));
+          const tip = document.createElement("div");
+          tip.className = "card-tooltip";
+          tip.textContent = c.name;
+          w.appendChild(tip);
+          hDiv.appendChild(w);
+        });
+      } else {
+        hDiv.className = "hand-side backs";
+        for (let i = 0; i < (cardCounts[String(pid)] || 0); i++) {
+          const w = document.createElement("div");
+          w.className = "card-wrap";
+          w.appendChild(makeBackImg("card-side-back"));
+          hDiv.appendChild(w);
+        }
+      }
+      seat.appendChild(hDiv);
+      shell.appendChild(seat);
+    });
+
+    // --- CENTER ARENA (4 Trick Slots + Hub) ---
+    const arena = document.createElement("div");
+    arena.className = "center-arena";
+
+    const playBySeat = {};
+    trickPlays.forEach((p) => { playBySeat[p.player] = p; });
+
+    let bottomSlotEl = null;
+
+    [
+      { pid: 2, cls: "slot-top" },
+      { pid: 3, cls: "slot-left" },
+      { pid: 1, cls: "slot-right" },
+      { pid: 0, cls: "slot-bottom" }
+    ].forEach(({ pid, cls }) => {
+      const slot = document.createElement("div");
+      const play = playBySeat[pid];
+      slot.className = "trick-slot " + cls + (play ? " filled" : "") + (trickWinner === pid ? " winner" : "");
+      if (pid === 0) bottomSlotEl = slot;
+
+      if (play) {
+        slot.appendChild(makeCardImg(play.id, play.name, "played-card"));
+        if (pid === trickLeader && trickSignal) {
+          const sig = document.createElement("div");
+          sig.className = "signal-badge " + trickSignal.toLowerCase();
+          sig.textContent = trickSignal.toUpperCase() + "!";
+          slot.appendChild(sig);
+        }
+        if (trickWinner === pid) {
+          const wb = document.createElement("div");
+          wb.className = "winner-badge";
+          wb.textContent = "⭐ WIN";
+          slot.appendChild(wb);
+        }
+      }
+      arena.appendChild(slot);
+    });
+
+    const hub = document.createElement("div");
+    hub.className = "table-hub";
+    hub.innerHTML =
+      '<div class="hub-trump">' + (args.trump_label || "Briscola: ...") + "</div>" +
+      '<div class="hub-sub">' + (args.trick_label || "") + "</div>" +
+      '<div class="hub-banner" id="hub-banner">' + (args.center_banner || "") + "</div>";
+
+    if (hubActions.length > 0) {
+      const actionsBar = document.createElement("div");
+      actionsBar.className = "hub-actions";
+      hubActions.forEach((act) => {
+        const btn = document.createElement("button");
+        btn.type = "button";
+        btn.className = "hub-btn" + (act.secondary ? " secondary" : "");
+        btn.textContent = act.label;
+        btn.addEventListener("pointerdown", function (ev) {
+          if (ev.button !== 0 || turnLocked) return;
+          ev.preventDefault();
+          turnLocked = true;
+          emitAction(act.action, act.payload || {}, turnToken);
+        });
+        actionsBar.appendChild(btn);
+      });
+      hub.appendChild(actionsBar);
+    }
+
+    arena.appendChild(hub);
+    shell.appendChild(arena);
+
+    // --- BOTTOM (Player 0 - Human / Team 0) ---
+    const bottomSeat = document.createElement("div");
+    bottomSeat.className = "seat-bottom";
+    const bottomHand = document.createElement("div");
+    bottomHand.className = "hand-row bottom-hand";
+
+    (hands["0"] || []).forEach((c) => {
+      const w = document.createElement("div");
+      const isLegal = legalSet.has(c.id);
+      let cls = "card-wrap";
+      if (interactive) {
+        cls += isLegal ? " legal" : " illegal";
+      }
+      w.className = cls;
+      w.appendChild(makeCardImg(c.id, c.name, "card-bottom"));
+
+      const tip = document.createElement("div");
+      tip.className = "card-tooltip";
+      tip.textContent = c.name;
+      w.appendChild(tip);
+
+      if (interactive && isLegal) {
+        w.addEventListener("pointerdown", function (ev) {
+          if (ev.button !== 0 || turnLocked) return;
+          ev.preventDefault();
+          turnLocked = true;
+
+          // Instant UI feedback: remove card from hand and place it on the table
+          w.remove();
+          if (bottomSlotEl) {
+            bottomSlotEl.innerHTML = "";
+            bottomSlotEl.classList.add("filled");
+            bottomSlotEl.appendChild(makeCardImg(c.id, c.name, "played-card"));
+          }
+          const countPill = document.getElementById("p0-count-pill");
+          if (countPill) {
+            countPill.textContent = formatCardCount(Math.max(0, (cardCounts["0"] || 1) - 1));
+          }
+          const bannerEl = document.getElementById("hub-banner");
+          if (bannerEl) {
+            bannerEl.textContent = "You played " + c.name;
+          }
+          bottomHand.querySelectorAll(".card-wrap").forEach((el) => {
+            el.classList.remove("legal");
+          });
+
+          emitAction("play_card", { card: c.id }, turnToken);
+        });
+      }
+      bottomHand.appendChild(w);
+    });
+
+    bottomSeat.appendChild(bottomHand);
+    bottomSeat.appendChild(
+      buildNameplate(seatNames["0"], cardCounts["0"], activePlayer === 0, "p0-count-pill")
+    );
+    shell.appendChild(bottomSeat);
+
+    root.appendChild(shell);
+    setTimeout(setFrameHeight, 20);
+  }
+
+  window.addEventListener("message", function (event) {
+    if (event.data && event.data.type === "streamlit:render") {
+      renderTable(event.data.args || {});
+    }
+  });
+
+  sendMessage("streamlit:componentReady", { apiVersion: 1 });
+  setFrameHeight();
+</script>
+</body>
+</html>

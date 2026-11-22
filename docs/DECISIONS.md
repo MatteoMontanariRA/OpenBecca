@@ -8,3 +8,10 @@
 - Built `NeuralISMCTSBot` (PUCT + belief filtering + `prior_temp=1.5`) and `expert_iter.py` (multi-core Expert Iteration distilling 1,200 `ISMCTSBot` hands / 34,024 decisions into `az_gen1_sharp.pt` with `--pi-sharpen 4.0 --value-coef 0.05`).
 - Promoted `rollout_weight=1.0` (neural policy priors + full determinized rollouts) to default: **`AlphaZero` (`az_gen1_sharp.pt`) beats `ISMCTSBot` `5.655` vs `5.435` pts/hand (`+0.220` net edge, `51.5%` win rate across 200 duplicate hands at 120 sims/move)**.
 - Integrated `AlphaZero` and `PPOBot` (with automatic checkpoint discovery and NN Prior % display) into `ui/app.py` and `benchmark.py`.
+### Phase 2 Decision Lab — HeuristicBotV2 Stockfish Audit (Trump & Opening)
+- Built `HeuristicBotV2` (formal 12-tier trump selection, Trick-1 opening plans, exact 10-trump counter, and suit card-counting) and `decision_lab.py` for paired Monte Carlo / `ISMCTSBot` A/B experiments (`EXP-01`..`EXP-12`).
+- **Stockfish-Validated Promotions**:
+  - `EXP-05`: Lowered length override threshold from `6` to `5` cards (**+2.600 +/- 0.90** margin, `88.0% vs 69.0%` win rate under `ISMCTSBot`).
+  - `EXP-01` & `EXP-01-FIXED`: Eliminated calling bare 2-card `3+2` as trump over any 3-card suit (**+1.860 +/- 0.91** general, **+1.200 +/- 1.04** canonical hand under `ISMCTSBot`).
+  - `EXP-06`: Switched `>= 4` trumps holding `3+A` Trick-1 lead to lowest trump (`Striscio`, saving `Tre` for `H04`), gaining **+4.2–4.8% win rate** across 3 independent tests (`88.4% vs 83.6%` over 250 `ISMCTSBot` deals).
+- **Confirmed Human Rules**: `EXP-02`, `EXP-04`, `EXP-08`, `EXP-09` (`-0.700` penalty for bare `3+A` lead), `EXP-10`, and `EXP-11` (`ISMCTSBot` disproved the heuristic false positive on 4–5 non-piece trumps).

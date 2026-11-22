@@ -1,8 +1,10 @@
 """OpenBecca local web interface built with Streamlit.
 
 Provides three modes:
-1. Play (1 Human vs 3 AI) with live Stockfish/AlphaZero move hints & Call-out.
-2. Watch 4 AI (spectator replay with all 4 hands revealed).
+1. Play (1 Human vs 3 AI) on a Romagnole card table with instant clickable cards,
+   step-by-step bot plays (configurable ms delay), and AlphaZero/Stockfish hints.
+2. Watch 4 AI (spectator replay with all 4 Romagnole hands revealed and
+   step-by-step animated play at configurable ms delay).
 3. Stockfish Studio (manual position setup & expected-value move ranking).
 """
 
@@ -16,6 +18,7 @@ from pathlib import Path
 from typing import Any
 
 import streamlit as st
+import streamlit.components.v1 as components
 
 from openbecca.agents import Agent, HeuristicBot, ISMCTSBot, RandomBot
 from openbecca.agents.ismcts_bot import MoveStats
@@ -23,7 +26,7 @@ from openbecca.analysis.evaluator import (
     build_custom_observation,
     evaluate_position,
 )
-from openbecca.cards import ALL_CARDS, Card, Deck, Suit
+from openbecca.cards import ALL_CARDS, Card, Deck, Rank, Suit
 from openbecca.engine import GameEngine
 from openbecca.rules import (
     CRICCA_BONUS_THIRDS,
@@ -50,21 +53,74 @@ SUIT_ICONS: dict[Suit, str] = {
     Suit.CLUBS: "🪵",
 }
 
+SUIT_TERMS: dict[Suit, str] = {
+    Suit.COINS: "denara",
+    Suit.CUPS: "coppe",
+    Suit.SWORDS: "spade",
+    Suit.CLUBS: "bastoni",
+}
+
+RANK_EN: dict[Rank, str] = {
+    Rank.ACE: "Ace",
+    Rank.TWO: "2",
+    Rank.THREE: "3",
+    Rank.FOUR: "4",
+    Rank.FIVE: "5",
+    Rank.SIX: "6",
+    Rank.SEVEN: "7",
+    Rank.KNAVE: "Jack",
+    Rank.KNIGHT: "Knight",
+    Rank.KING: "King",
+}
+
 CHECKPOINT_DIR = Path("checkpoints")
 PREFERRED_CHECKPOINTS = ("az_gen1_sharp.pt", "az_gen1.pt", "ppo_best.pt", "ppo_latest.pt")
 
+TABLE_COMPONENT_DIR = Path(__file__).resolve().parent / "assets"
+CARDS_DIR = TABLE_COMPONENT_DIR / "cards"
+_becca_table = components.declare_component("becca_table", path=str(TABLE_COMPONENT_DIR))
+
+
+def card_id(card: Card) -> str:
+    return f"{card.suit.name}_{card.rank.name}"
+
+
+def card_from_id(cid: str) -> Card:
+    suit_name, rank_name = cid.split("_", 1)
+    return Card(Suit[suit_name], Rank[rank_name])
+
+
+def sort_hand_romagnole(cards: list[Card]) -> list[Card]:
+    """Order denara, coppe, spade, bastoni using OpenBecca's canonical sort_key."""
+    return sorted(cards, key=lambda c: c.sort_key())
+
+
+def card_display_name(card: Card) -> str:
+    """Format card name in English with Romagnolo suit (e.g. '7 of denara')."""
+    return f"{RANK_EN[card.rank]} of {SUIT_TERMS[card.suit]}"
+
 
 def card_badge(card: Card) -> str:
-    """Return Italian written card name prefixed with a subtle suit icon."""
-    return f"{SUIT_ICONS[card.suit]} {card.italian_name}"
+    return f"{SUIT_ICONS[card.suit]} {card_display_name(card)}"
 
 
 def suit_badge(suit: Suit) -> str:
-    return f"{SUIT_ICONS[suit]} {suit.italian_name}"
+    return f"{SUIT_ICONS[suit]} {SUIT_TERMS[suit]}"
+
+
+def signal_label(sig: Signal) -> str:
+    if sig == Signal.NONE:
+        return "—"
+    return sig.value.lower()
+
+
+def count_downloaded_cards() -> int:
+    if not CARDS_DIR.exists():
+        return 0
+    return sum(1 for c in ALL_CARDS if (CARDS_DIR / f"{card_id(c)}.png").exists())
 
 
 def discover_checkpoints() -> list[str]:
-    """Scan checkpoints/ for saved PyTorch models, ordered by preference."""
     if not CHECKPOINT_DIR.exists():
         return []
     found = [p for p in CHECKPOINT_DIR.glob("*.pt") if p.is_file()]
@@ -75,7 +131,6 @@ def discover_checkpoints() -> list[str]:
 
 @st.cache_resource
 def load_cached_neural_model(checkpoint_path: str) -> Any:
-    """Load ActorCriticNet once per checkpoint path across Streamlit reruns."""
     import torch
     from openbecca.rl.ppo_bot import PPOBot
 
@@ -129,6 +184,66 @@ def create_bot(
     raise ValueError(f"Unknown bot type: {bot_type}")
 
 
+def render_table_component(
+    *,
+    hands: dict[int, list[Card]],
+    hand_visible: dict[int, bool],
+    seat_names: dict[int, str],
+    legal_cards: list[Card],
+    interactive: bool,
+    active_player: int | None,
+    trick_plays: list[TrickPlay] | tuple[TrickPlay, ...],
+    trick_leader: int | None,
+    trick_signal: Signal,
+    trick_winner: int | None,
+    trump_suit: Suit | None,
+    trick_label: str,
+    center_banner: str = "",
+    hub_actions: list[dict[str, Any]] | None = None,
+    turn_token: str = "",
+    key: str = "becca_table_main",
+) -> dict[str, Any] | None:
+    """Serialize game state and invoke the visual Romagnole card table component."""
+    hands_payload: dict[str, list[dict[str, str]]] = {}
+    counts_payload: dict[str, int] = {}
+    for pid in range(4):
+        ordered = sort_hand_romagnole(hands[pid])
+        counts_payload[str(pid)] = len(ordered)
+        if hand_visible[pid]:
+            hands_payload[str(pid)] = [
+                {"id": card_id(c), "name": card_display_name(c)} for c in ordered
+            ]
+        else:
+            hands_payload[str(pid)] = []
+
+    plays_payload = [
+        {"player": pl.player, "id": card_id(pl.card), "name": card_display_name(pl.card)}
+        for pl in trick_plays
+    ]
+    trump_label = f"Briscola: {suit_badge(trump_suit)}" if trump_suit else "Choosing briscola..."
+
+    return _becca_table(
+        hands=hands_payload,
+        card_counts=counts_payload,
+        hand_visible={str(k): v for k, v in hand_visible.items()},
+        seat_names={str(k): v for k, v in seat_names.items()},
+        legal_ids=[card_id(c) for c in legal_cards],
+        interactive=interactive,
+        active_player=active_player,
+        trick_plays=plays_payload,
+        trick_leader=trick_leader,
+        trick_signal=trick_signal.value.lower() if trick_signal != Signal.NONE else "",
+        trick_winner=trick_winner,
+        trump_label=trump_label,
+        trick_label=trick_label,
+        center_banner=center_banner,
+        hub_actions=hub_actions or [],
+        turn_token=turn_token,
+        key=key,
+        default=None,
+    )
+
+
 def run_position_analysis(
     obs: Observation,
     *,
@@ -137,7 +252,6 @@ def run_position_analysis(
     checkpoint_path: str | None,
     rollout_weight: float,
 ) -> dict[str, Any]:
-    """Run either classic ISMCTSBot or AlphaZero analysis and return a unified dict."""
     if engine == "AlphaZero" and checkpoint_path is not None:
         from openbecca.rl.neural_mcts import NeuralISMCTSBot
         from openbecca.rl.ppo_bot import PPOBot
@@ -183,7 +297,7 @@ def run_position_analysis(
             "best_margin": stats[0].expected_margin,
             "best_win": stats[0].win_probability,
             "rows": rows,
-            "chart_data": {s.card.italian_name: round(s.expected_margin, 2) for s in stats},
+            "chart_data": {card_display_name(s.card): round(s.expected_margin, 2) for s in stats},
         }
 
     analysis = evaluate_position(obs, simulations=simulations)
@@ -213,18 +327,17 @@ def run_position_analysis(
         "best_win": best.win_probability,
         "rows": rows,
         "chart_data": {
-            ev.card.italian_name: round(ev.expected_margin, 2)
+            card_display_name(ev.card): round(ev.expected_margin, 2)
             for ev in analysis.evaluations
         },
     }
 
 
 def render_analysis_panel(result: dict[str, Any]) -> None:
-    """Display Stockfish/AlphaZero move ranking table and visual margin chart."""
     st.caption(
         f"Engine: **{result['engine_label']}** | "
         f"{result['total_simulations']} simulations in {result['elapsed_seconds']:.2f}s | "
-        f"Trump: {suit_badge(result['trump_suit'])} | Trick {result['trick_number']}/10"
+        f"Briscola: {suit_badge(result['trump_suit'])} | Trick {result['trick_number']}/10"
     )
     st.success(
         f"Best move: **{card_badge(result['best_card'])}** "
@@ -277,6 +390,20 @@ def _init_play_match(
     }
     st.session_state.play = {
         "agents": agents,
+        "match_cfg": {
+            "partner_type": partner_type,
+            "opp_type": opp_type,
+            "ai_sims": ai_sims,
+            "target_score": target_score,
+            "checkpoint_path": checkpoint_path,
+            "rollout_weight": rollout_weight,
+        },
+        "seat_names": {
+            0: "You (P0 · Team 0)",
+            1: f"P1 · {opp_type} (T1)",
+            2: f"P2 · {partner_type} (T0)",
+            3: f"P3 · {opp_type} (T1)",
+        },
         "deck": Deck(seed=seed),
         "target_score": target_score,
         "match_scores": [0, 0],
@@ -293,6 +420,7 @@ def _init_play_match(
         "cricca_prompt_player": None,
         "status_banner": "",
         "hint": None,
+        "last_event_seq": None,
     }
     _start_new_hand()
 
@@ -321,21 +449,77 @@ def _start_new_hand() -> None:
         match_scores=(p["match_scores"][0], p["match_scores"][1]),
         target_score=p["target_score"],
     )
+    state.current_trick_leader = caller
     p["state"] = state
 
     if caller == 0:
         p["phase"] = "HUMAN_TRUMP"
         p["status_banner"] = (
-            "You hold Quattro di Denari! Choose the trump suit."
+            "You hold 4 of denara! Choose the briscola suit."
             if p["hand_number"] == 1
-            else "It is your turn to choose the trump suit."
+            else "It is your turn to choose the briscola suit."
         )
     else:
         obs = state.build_observation(caller)
         chosen = p["agents"][caller].choose_trump(obs)
         state.trump_suit = chosen
-        p["status_banner"] = f"Player {caller} called trump: {suit_badge(chosen)}."
+        p["status_banner"] = f"Player {caller} chose briscola: {suit_badge(chosen)}."
         _run_cricca_phase()
+
+
+def _on_choose_trump(suit: Suit) -> None:
+    p = st.session_state.play
+    if p["phase"] != "HUMAN_TRUMP":
+        return
+    state: HandState = p["state"]
+    state.trump_suit = suit
+    p["status_banner"] = f"You chose briscola: {suit_badge(suit)}."
+    _run_cricca_phase()
+
+
+def _on_decide_cricca(declare: bool) -> None:
+    p = st.session_state.play
+    if p["phase"] != "HUMAN_CRICCA":
+        return
+    state: HandState = p["state"]
+    if declare:
+        state.cricca_declared_by = 0
+        state.hand_thirds[0] += CRICCA_BONUS_THIRDS
+        p["status_banner"] = "You declared cricca (+3 pts)!"
+    else:
+        p["status_banner"] = "You chose not to declare cricca."
+    _after_cricca_phase()
+
+
+def _on_next_trick() -> None:
+    p = st.session_state.play
+    if p["phase"] != "TRICK_COMPLETE":
+        return
+    _continue_after_trick_pause()
+
+
+def _on_deal_next_hand() -> None:
+    p = st.session_state.play
+    if p["phase"] != "HAND_OVER":
+        return
+    _start_new_hand()
+
+
+def _on_callout_human() -> None:
+    _resolve_callout(calling_team=0)
+
+
+def _on_restart_match() -> None:
+    cfg = st.session_state.play["match_cfg"]
+    _init_play_match(
+        cfg["partner_type"],
+        cfg["opp_type"],
+        cfg["ai_sims"],
+        cfg["target_score"],
+        None,
+        cfg["checkpoint_path"],
+        cfg["rollout_weight"],
+    )
 
 
 def _run_cricca_phase() -> None:
@@ -355,9 +539,7 @@ def _run_cricca_phase() -> None:
                 state.cricca_declared_by = pid
                 state.hand_thirds[team_of(pid)] += CRICCA_BONUS_THIRDS
                 label = "in-hand" if pid == state.trump_caller else "out-of-hand"
-                p["status_banner"] += (
-                    f" Player {pid} declared {label} Cricca (+3 pts)!"
-                )
+                p["status_banner"] += f" Player {pid} declared {label} cricca (+3 pts)!"
             break
 
     _after_cricca_phase()
@@ -378,7 +560,6 @@ def _after_cricca_phase() -> None:
                 return
 
     p["phase"] = "PLAY_TRICK"
-    _advance_until_human_or_pause()
 
 
 def _resolve_callout(calling_team: int) -> None:
@@ -410,7 +591,7 @@ def _resolve_callout(calling_team: int) -> None:
     who = "Your team (Team 0)" if calling_team == 0 else "Opponents (Team 1)"
     if outcome.succeeded:
         p["status_banner"] = (
-            f"{who} called out (Chiamarsi fuori) with {outcome.verified_total} pts — VALID WIN!"
+            f"{who} called out with {outcome.verified_total} pts — VALID WIN!"
         )
     else:
         p["status_banner"] = (
@@ -500,21 +681,26 @@ def _commit_card_play(pid: int, card: Card) -> None:
             p["phase"] = "TRICK_COMPLETE"
 
 
-def _advance_until_human_or_pause() -> None:
+def _step_one_bot(bot_delay_ms: int) -> None:
+    """Play strictly ONE bot card with user-configured ms pacing, then trigger rerun."""
     p = st.session_state.play
     state: HandState = p["state"]
+    pid = _current_player(state)
+    if pid == 0:
+        return
 
-    while p["phase"] == "PLAY_TRICK":
-        pid = _current_player(state)
-        if pid == 0:
-            return
-        agent = p["agents"][pid]
-        legal = _legal_for_player(
-            state, pid, enforce_busso=agent.enforce_busso_constraints
-        )
-        obs = state.build_observation(pid, legal_cards=tuple(legal))
-        chosen = agent.choose_card(obs)
-        _commit_card_play(pid, chosen)
+    t0 = time.perf_counter()
+    agent = p["agents"][pid]
+    legal = _legal_for_player(state, pid, enforce_busso=agent.enforce_busso_constraints)
+    obs = state.build_observation(pid, legal_cards=tuple(legal))
+    chosen = agent.choose_card(obs)
+    compute_s = time.perf_counter() - t0
+
+    remaining_s = max(0.05, (bot_delay_ms / 1000.0) - compute_s)
+    time.sleep(remaining_s)
+
+    _commit_card_play(pid, chosen)
+    st.rerun()
 
 
 def _continue_after_trick_pause() -> None:
@@ -532,7 +718,6 @@ def _continue_after_trick_pause() -> None:
                 return
 
     p["phase"] = "PLAY_TRICK"
-    _advance_until_human_or_pause()
 
 
 def _finalize_completed_hand() -> None:
@@ -581,7 +766,23 @@ def _finalize_completed_hand() -> None:
         p["phase"] = "HAND_OVER"
 
 
-def render_play_mode(checkpoint_path: str | None, rollout_weight: float) -> None:
+def _consume_table_event(event: Any, turn_token: str) -> dict[str, Any] | None:
+    """Validate and deduplicate a click event coming from the card table iframe."""
+    p = st.session_state.play
+    if (
+        isinstance(event, dict)
+        and event.get("seq") is not None
+        and event.get("seq") != p["last_event_seq"]
+        and event.get("turn_token") == turn_token
+    ):
+        p["last_event_seq"] = event.get("seq")
+        return event
+    return None
+
+
+def render_play_mode(
+    checkpoint_path: str | None, rollout_weight: float, bot_delay_ms: int
+) -> None:
     st.header("Play Beccacino (1 Human + 3 AI)")
     bot_options = available_bot_types(checkpoint_path is not None)
 
@@ -630,7 +831,7 @@ def render_play_mode(checkpoint_path: str | None, rollout_weight: float) -> None
     p = st.session_state.play
     state: HandState = p["state"]
 
-    # Top scoreboard
+    # Scoreboard
     c1, c2, c3, c4 = st.columns(4)
     t0_hand_pts = thirds_to_points(state.hand_thirds[0])
     t1_hand_pts = thirds_to_points(state.hand_thirds[1])
@@ -645,7 +846,7 @@ def render_play_mode(checkpoint_path: str | None, rollout_weight: float) -> None
         delta=f"+{t1_hand_pts} ({state.hand_thirds[1] % 3}/3) this hand",
     )
     c3.metric(
-        "Trump Suit",
+        "Briscola",
         suit_badge(state.trump_suit) if state.trump_suit else "Choosing...",
         delta=f"Caller: Player {state.trump_caller}",
     )
@@ -660,113 +861,140 @@ def render_play_mode(checkpoint_path: str | None, rollout_weight: float) -> None
     if p["status_banner"]:
         st.info(p["status_banner"])
 
-    # Phase 1: Human chooses trump
+    hands_dict = {pid: list(state.hands[pid]) for pid in range(4)}
+    visibility = {0: True, 1: False, 2: False, 3: False}
+
+    # ------------------------------------------------------------------
+    # Phase 1: Human chooses briscola (ONLY inside the table center hub)
+    # ------------------------------------------------------------------
     if p["phase"] == "HUMAN_TRUMP":
-        st.subheader("Your Hand")
-        st.write(" | ".join(card_badge(c) for c in state.hands[0]))
-        st.subheader("Choose Trump Suit")
-        cols = st.columns(4)
-        for idx, suit in enumerate(Suit):
-            if cols[idx].button(
-                suit_badge(suit), use_container_width=True, key=f"trump_{suit.name}"
-            ):
-                state.trump_suit = suit
-                p["status_banner"] = f"You called trump: {suit_badge(suit)}."
-                _run_cricca_phase()
-                st.rerun()
-        return
-
-    # Phase 2: Human holds trump Cricca
-    if p["phase"] == "HUMAN_CRICCA":
-        st.subheader("You hold Trump Cricca (Asso + Due + Tre)!")
-        st.write(" | ".join(card_badge(c) for c in state.hands[0]))
-        col_a, col_b = st.columns(2)
-        if col_a.button("Declare Cricca (+3 pts)", type="primary", use_container_width=True):
-            state.cricca_declared_by = 0
-            state.hand_thirds[0] += CRICCA_BONUS_THIRDS
-            p["status_banner"] = "You declared Cricca (+3 pts)!"
-            _after_cricca_phase()
-            st.rerun()
-        if col_b.button("Do Not Declare (Forfeit +3 pts)", use_container_width=True):
-            p["status_banner"] = "You chose not to declare Cricca."
-            _after_cricca_phase()
-            st.rerun()
-        return
-
-    # Table Display
-    st.subheader("Table")
-    if p["phase"] == "TRICK_COMPLETE" and p["last_trick"] is not None:
-        rec: TrickRecord = p["last_trick"]
-        sig_txt = f" — Signal: **{rec.signal.value}**" if rec.signal != Signal.NONE else ""
-        st.markdown(
-            f"**Trick {rec.trick_number} completed** (Leader: Player {rec.leader}{sig_txt}) → "
-            f"Winner: **Player {rec.winner} (Team {team_of(rec.winner)})** | "
-            f"+{rec.points_thirds // 3} pts & {rec.points_thirds % 3}/3"
+        turn_token = f"trump-{state.hand_number}"
+        hub_actions = [
+            {
+                "label": suit_badge(suit),
+                "action": "choose_trump",
+                "payload": {"suit": suit.name},
+            }
+            for suit in Suit
+        ]
+        event = render_table_component(
+            hands=hands_dict,
+            hand_visible=visibility,
+            seat_names=p["seat_names"],
+            legal_cards=[],
+            interactive=False,
+            active_player=0,
+            trick_plays=[],
+            trick_leader=None,
+            trick_signal=Signal.NONE,
+            trick_winner=None,
+            trump_suit=None,
+            trick_label=f"Hand {state.hand_number} · Choosing briscola",
+            center_banner="Select the briscola suit:",
+            hub_actions=hub_actions,
+            turn_token=turn_token,
+            key="play_table",
         )
-        tcols = st.columns(4)
-        for idx, play in enumerate(rec.plays):
-            winner_mark = " ⭐" if play.player == rec.winner else ""
-            tcols[idx].markdown(f"**P{play.player}{winner_mark}**\n\n{card_badge(play.card)}")
-
-        btn_a, btn_b = st.columns([2, 1])
-        if btn_a.button("Next Trick", type="primary", use_container_width=True):
-            _continue_after_trick_pause()
+        valid = _consume_table_event(event, turn_token)
+        if valid and valid.get("action") == "choose_trump":
+            _on_choose_trump(Suit[valid["suit"]])
             st.rerun()
-        if not p["in_sudden_death"]:
-            if btn_b.button("Chiamarsi fuori (Call Out)", use_container_width=True):
-                _resolve_callout(calling_team=0)
-                st.rerun()
+        return
 
-    elif p["phase"] == "PLAY_TRICK":
-        if state.current_trick:
-            sig_txt = (
-                f" — Signal: **{state.current_trick_signal.value}**"
-                if state.current_trick_signal != Signal.NONE
-                else " — Signal: *(silence)*"
-            )
-            st.markdown(f"Leader: **Player {state.current_trick_leader}**{sig_txt}")
-            tcols = st.columns(4)
-            for idx, play in enumerate(state.current_trick):
-                tcols[idx].markdown(f"**Player {play.player}**\n\n{card_badge(play.card)}")
-        else:
-            st.write("Table is empty — **you lead this trick!**")
+    # ------------------------------------------------------------------
+    # Phase 2: Human decides cricca (ONLY inside the table center hub)
+    # ------------------------------------------------------------------
+    if p["phase"] == "HUMAN_CRICCA":
+        turn_token = f"cricca-{state.hand_number}"
+        event = render_table_component(
+            hands=hands_dict,
+            hand_visible=visibility,
+            seat_names=p["seat_names"],
+            legal_cards=[],
+            interactive=False,
+            active_player=0,
+            trick_plays=[],
+            trick_leader=None,
+            trick_signal=Signal.NONE,
+            trick_winner=None,
+            trump_suit=state.trump_suit,
+            trick_label=f"Hand {state.hand_number} · Cricca!",
+            center_banner="You hold briscola cricca (+3 pts)!",
+            hub_actions=[
+                {"label": "Declare cricca (+3)", "action": "decide_cricca", "payload": {"declare": True}},
+                {"label": "Skip", "action": "decide_cricca", "payload": {"declare": False}, "secondary": True},
+            ],
+            turn_token=turn_token,
+            key="play_table",
+        )
+        valid = _consume_table_event(event, turn_token)
+        if valid and valid.get("action") == "decide_cricca":
+            _on_decide_cricca(bool(valid.get("declare", True)))
+            st.rerun()
+        return
+
+    # ------------------------------------------------------------------
+    # Phase 3: Active Trick Play (Human click or 1-by-1 Bot play)
+    # ------------------------------------------------------------------
+    if p["phase"] == "PLAY_TRICK":
+        curr_pid = _current_player(state)
+        is_human_turn = curr_pid == 0
+        legal = _legal_for_player(state, 0, enforce_busso=False) if is_human_turn else []
+        turn_token = (
+            f"{state.hand_number}-{len(state.completed_tricks)}-"
+            f"{len(state.current_trick)}-{curr_pid}"
+        )
+        banner = (
+            "Your turn — click a highlighted card!"
+            if is_human_turn
+            else f"Player {curr_pid} is playing..."
+        )
+
+        event = render_table_component(
+            hands=hands_dict,
+            hand_visible=visibility,
+            seat_names=p["seat_names"],
+            legal_cards=legal,
+            interactive=is_human_turn,
+            active_player=curr_pid,
+            trick_plays=state.current_trick,
+            trick_leader=state.current_trick_leader if state.current_trick else None,
+            trick_signal=state.current_trick_signal,
+            trick_winner=None,
+            trump_suit=state.trump_suit,
+            trick_label=f"Hand {state.hand_number} · Trick {len(state.completed_tricks) + 1}/10",
+            center_banner=banner,
+            turn_token=turn_token,
+            key="play_table",
+        )
+
+        if not is_human_turn:
+            _step_one_bot(bot_delay_ms)
+            return
+
+        valid = _consume_table_event(event, turn_token)
+        if valid and valid.get("action") == "play_card":
+            chosen = card_from_id(valid["card"])
+            if chosen in set(legal):
+                _commit_card_play(0, chosen)
+                st.rerun()
 
         if (
             not p["in_sudden_death"]
             and len(state.completed_tricks) == 0
             and len(state.current_trick) == 0
         ):
-            if st.button("Chiamarsi fuori (Early Call Out before Trick 1)"):
-                _resolve_callout(calling_team=0)
-                st.rerun()
+            st.button(
+                "Call Out (before Trick 1)",
+                key="early_callout_btn",
+                on_click=_on_callout_human,
+            )
 
-        st.subheader("Your Hand (Click a Legal Card to Play)")
-        legal = _legal_for_player(state, 0, enforce_busso=False)
-        legal_set = set(legal)
-        hand_cards = list(state.hands[0])
-
-        cols_per_row = 5
-        for row_start in range(0, len(hand_cards), cols_per_row):
-            row_cards = hand_cards[row_start : row_start + cols_per_row]
-            cols = st.columns(len(row_cards))
-            for idx, card in enumerate(row_cards):
-                is_legal = card in legal_set
-                if cols[idx].button(
-                    card_badge(card),
-                    disabled=not is_legal,
-                    use_container_width=True,
-                    key=f"play_{len(state.completed_tricks)}_{card.suit.name}_{card.rank.name}",
-                ):
-                    _commit_card_play(0, card)
-                    if p["phase"] == "PLAY_TRICK":
-                        _advance_until_human_or_pause()
-                    st.rerun()
-
-        st.divider()
         col_h1, _ = st.columns([1, 2])
         if col_h1.button(
             f"Analyze Best Move ({hint_engine}, {hint_sims} sims)",
             use_container_width=True,
+            key="analyze_hint_btn",
         ):
             obs = state.build_observation(0, legal_cards=tuple(legal))
             with st.spinner(f"Running OpenBecca {hint_engine} search..."):
@@ -780,17 +1008,86 @@ def render_play_mode(checkpoint_path: str | None, rollout_weight: float) -> None
         if p["hint"] is not None:
             render_analysis_panel(p["hint"])
 
+    # ------------------------------------------------------------------
+    # Phase 4: Trick Complete (ONLY inside the table center hub)
+    # ------------------------------------------------------------------
+    elif p["phase"] == "TRICK_COMPLETE" and p["last_trick"] is not None:
+        rec: TrickRecord = p["last_trick"]
+        turn_token = f"done-{state.hand_number}-{rec.trick_number}"
+        pts_txt = f"+{rec.points_thirds // 3} pts & {rec.points_thirds % 3}/3"
+
+        hub_actions: list[dict[str, Any]] = [
+            {"label": "Next Trick ▶", "action": "next_trick"}
+        ]
+        if not p["in_sudden_death"]:
+            hub_actions.append({"label": "Call Out", "action": "callout", "secondary": True})
+
+        event = render_table_component(
+            hands=hands_dict,
+            hand_visible=visibility,
+            seat_names=p["seat_names"],
+            legal_cards=[],
+            interactive=False,
+            active_player=rec.winner,
+            trick_plays=rec.plays,
+            trick_leader=rec.leader,
+            trick_signal=rec.signal,
+            trick_winner=rec.winner,
+            trump_suit=state.trump_suit,
+            trick_label=f"Hand {state.hand_number} · Trick {rec.trick_number}/10 Complete",
+            center_banner=f"P{rec.winner} (Team {team_of(rec.winner)}) wins · {pts_txt}",
+            hub_actions=hub_actions,
+            turn_token=turn_token,
+            key="play_table",
+        )
+        valid = _consume_table_event(event, turn_token)
+        if valid:
+            if valid.get("action") == "next_trick":
+                _on_next_trick()
+                st.rerun()
+            elif valid.get("action") == "callout":
+                _on_callout_human()
+                st.rerun()
+
+    # ------------------------------------------------------------------
+    # Phase 5: Hand Over (ONLY inside the table center hub)
+    # ------------------------------------------------------------------
     elif p["phase"] == "HAND_OVER":
+        turn_token = f"handover-{state.hand_number}"
         last_hand: HandResult = p["hands_log"][-1]
+        rec = p["last_trick"]
+
+        event = render_table_component(
+            hands=hands_dict,
+            hand_visible=visibility,
+            seat_names=p["seat_names"],
+            legal_cards=[],
+            interactive=False,
+            active_player=rec.winner if rec is not None else None,
+            trick_plays=rec.plays if rec is not None else [],
+            trick_leader=rec.leader if rec is not None else None,
+            trick_signal=rec.signal if rec is not None else Signal.NONE,
+            trick_winner=rec.winner if rec is not None else None,
+            trump_suit=state.trump_suit,
+            trick_label=f"Hand {state.hand_number} · Finished",
+            center_banner=f"Team 0 +{last_hand.hand_points[0]} | Team 1 +{last_hand.hand_points[1]}",
+            hub_actions=[{"label": "Deal Next Hand ▶", "action": "next_hand"}],
+            turn_token=turn_token,
+            key="play_table",
+        )
         st.success(
             f"Hand {last_hand.hand_number} finished! "
             f"Team 0: **+{last_hand.hand_points[0]} pts** | "
             f"Team 1: **+{last_hand.hand_points[1]} pts**"
         )
-        if st.button("Deal Next Hand", type="primary", use_container_width=True):
-            _start_new_hand()
+        valid = _consume_table_event(event, turn_token)
+        if valid and valid.get("action") == "next_hand":
+            _on_deal_next_hand()
             st.rerun()
 
+    # ------------------------------------------------------------------
+    # Phase 6: Match Over
+    # ------------------------------------------------------------------
     elif p["phase"] == "MATCH_OVER":
         winner = p["match_winner"]
         if winner == 0:
@@ -813,11 +1110,20 @@ def render_play_mode(checkpoint_path: str | None, rollout_weight: float) -> None
             ended_by_callout=p["ended_by_callout"],
             sudden_death_played=p["sudden_death_played"],
         )
-        st.download_button(
+        mcol1, mcol2 = st.columns(2)
+        mcol1.button(
+            "Start New Match ▶",
+            type="primary",
+            use_container_width=True,
+            key="restart_match_btn",
+            on_click=_on_restart_match,
+        )
+        mcol2.download_button(
             "Download Match Replay (JSON)",
             data=json.dumps(match_res.to_dict(), indent=2, ensure_ascii=False),
             file_name="openbecca_match_replay.json",
             mime="application/json",
+            use_container_width=True,
         )
 
     if state.completed_tricks:
@@ -825,14 +1131,14 @@ def render_play_mode(checkpoint_path: str | None, rollout_weight: float) -> None
             rows = []
             for t in state.completed_tricks:
                 plays_str = " | ".join(
-                    f"P{pl.player}: {pl.card.italian_name}" for pl in t.plays
+                    f"P{pl.player}: {card_display_name(pl.card)}" for pl in t.plays
                 )
                 rows.append(
                     {
                         "Trick": t.trick_number,
                         "Leader": f"P{t.leader}",
-                        "Signal": t.signal.value or "—",
-                        "Plays": plays_str,
+                        "Signal": signal_label(t.signal),
+                        "Cards Played": plays_str,
                         "Winner": f"P{t.winner} (T{team_of(t.winner)})",
                         "Thirds": t.points_thirds,
                     }
@@ -841,10 +1147,106 @@ def render_play_mode(checkpoint_path: str | None, rollout_weight: float) -> None
 
 
 # ======================================================================
-# MODE 2: WATCH 4 AI
+# MODE 2: WATCH 4 AI (ALL 4 HANDS REVEALED + STEP-BY-STEP PLAY)
 # ======================================================================
-def render_watch_mode(checkpoint_path: str | None, rollout_weight: float) -> None:
-    st.header("Watch 4 AI Simulation (Spectator Mode)")
+def _watch_reset() -> None:
+    st.session_state.watch["step"] = 0
+    st.session_state.watch["playing"] = False
+
+
+def _watch_prev() -> None:
+    w = st.session_state.watch
+    w["step"] = max(0, w["step"] - 1)
+    w["playing"] = False
+
+
+def _watch_next(max_step: int) -> None:
+    w = st.session_state.watch
+    w["step"] = min(max_step, w["step"] + 1)
+    w["playing"] = False
+
+
+def _watch_toggle_play(max_step: int) -> None:
+    w = st.session_state.watch
+    if w["playing"]:
+        w["playing"] = False
+    else:
+        if w["step"] >= max_step:
+            w["step"] = 0
+        w["playing"] = True
+
+def _watch_on_slider_change() -> None:
+    w = st.session_state.watch
+    w["step"] = int(st.session_state["watch_timeline_slider"])
+    w["playing"] = False
+
+def _reconstruct_watch_frame(
+    dealt: list[list[Card]], res: HandResult, step: int
+) -> dict[str, Any]:
+    """Reconstruct exact hands, table cards, and running scores after `step` plays (0..40)."""
+    hands = {pid: list(dealt[pid]) for pid in range(4)}
+    thirds = [0, 0]
+    if res.cricca_declared_by is not None:
+        thirds[team_of(res.cricca_declared_by)] += CRICCA_BONUS_THIRDS
+
+    if step == 0:
+        return {
+            "hands": hands,
+            "trick_plays": [],
+            "trick_leader": None,
+            "trick_signal": Signal.NONE,
+            "trick_winner": None,
+            "active_player": res.tricks[0].leader if res.tricks else None,
+            "trick_label": "Initial Deal · Ready (0/40)",
+            "banner": "Press ▶ Play or Next to watch card by card",
+            "thirds": thirds,
+        }
+
+    trick_idx = (step - 1) // 4
+    cards_shown = ((step - 1) % 4) + 1
+
+    for ti in range(trick_idx):
+        tr = res.tricks[ti]
+        for pl in tr.plays:
+            hands[pl.player].remove(pl.card)
+        thirds[team_of(tr.winner)] += tr.points_thirds
+
+    curr_tr = res.tricks[trick_idx]
+    shown_plays = list(curr_tr.plays[:cards_shown])
+    for pl in shown_plays:
+        hands[pl.player].remove(pl.card)
+
+    trick_winner = None
+    if cards_shown == 4:
+        thirds[team_of(curr_tr.winner)] += curr_tr.points_thirds
+        trick_winner = curr_tr.winner
+        banner = (
+            f"P{curr_tr.winner} (Team {team_of(curr_tr.winner)}) wins · "
+            f"+{curr_tr.points_thirds // 3} pts & {curr_tr.points_thirds % 3}/3"
+        )
+        active = curr_tr.winner
+    else:
+        last_pl = shown_plays[-1]
+        banner = f"P{last_pl.player} played {card_display_name(last_pl.card)}"
+        active = last_pl.player
+
+    return {
+        "hands": hands,
+        "trick_plays": shown_plays,
+        "trick_leader": curr_tr.leader,
+        "trick_signal": curr_tr.signal,
+        "trick_winner": trick_winner,
+        "active_player": active,
+        "trick_label": f"Trick {curr_tr.trick_number}/10 · Card {step}/40",
+        "banner": banner,
+        "thirds": thirds,
+    }
+
+
+def render_watch_mode(
+    checkpoint_path: str | None, rollout_weight: float, bot_delay_ms: int
+) -> None:
+    st.header("Watch 4 AI Simulation (All 4 Hands Revealed)")
     bot_options = available_bot_types(checkpoint_path is not None)
 
     col1, col2, col3, col4 = st.columns(4)
@@ -893,59 +1295,151 @@ def render_watch_mode(checkpoint_path: str | None, rollout_weight: float) -> Non
         ]
         with st.spinner("Simulating 4-AI hand..."):
             res = GameEngine(agents).play_hand(allow_callout=False, dealt_hands=dealt)
-        st.session_state.watch_result = {
+        st.session_state.watch = {
             "dealt": dealt,
             "result": res,
             "team0": team0_type,
             "team1": team1_type,
+            "step": 0,
+            "playing": True,
         }
+        st.rerun()
 
-    if "watch_result" not in st.session_state:
-        st.info("Configure both teams above and click **Simulate Hand** to watch every trick.")
+    if "watch" not in st.session_state:
+        st.info(
+            "Configure both teams above and click **Simulate Hand** to watch all 4 hands "
+            "face-up and follow every play card by card."
+        )
         return
 
-    data = st.session_state.watch_result
-    res: HandResult = data["result"]
-    dealt: list[list[Card]] = data["dealt"]
+    w = st.session_state.watch
+    res: HandResult = w["result"]
+    dealt: list[list[Card]] = w["dealt"]
+    max_step = len(res.tricks) * 4
+
+    frame = _reconstruct_watch_frame(dealt, res, w["step"])
+    thirds = frame["thirds"]
 
     m1, m2, m3 = st.columns(3)
-    m1.metric(f"Team 0 ({data['team0']})", f"{res.hand_points[0]} pts", f"{res.hand_thirds[0]} thirds")
-    m2.metric(f"Team 1 ({data['team1']})", f"{res.hand_points[1]} pts", f"{res.hand_thirds[1]} thirds")
+    m1.metric(
+        f"Team 0 ({w['team0']})",
+        f"{thirds_to_points(thirds[0])} pts",
+        f"{thirds[0] % 3}/3 thirds (Final: {res.hand_points[0]} pts)",
+    )
+    m2.metric(
+        f"Team 1 ({w['team1']})",
+        f"{thirds_to_points(thirds[1])} pts",
+        f"{thirds[1] % 3}/3 thirds (Final: {res.hand_points[1]} pts)",
+    )
     m3.metric(
-        "Trump & Cricca",
+        "Briscola & Cricca",
         suit_badge(res.trump_suit),
         f"Caller: P{res.trump_caller} | Cricca: {f'P{res.cricca_declared_by}' if res.cricca_declared_by is not None else 'None'}",
     )
 
-    with st.expander("Initial Dealt Hands (All 4 Players)"):
-        hcols = st.columns(4)
-        for pid in range(4):
-            hcols[pid].markdown(f"**Player {pid} (Team {team_of(pid)})**")
-            for card in dealt[pid]:
-                hcols[pid].write(card_badge(card))
+    if w["playing"] and w["step"] >= max_step:
+        w["playing"] = False
 
-    st.subheader("Trick-by-Trick Replay")
-    rows = []
-    for t in res.tricks:
-        plays_str = " | ".join(f"P{pl.player}: {pl.card.italian_name}" for pl in t.plays)
-        rows.append(
-            {
-                "Trick": t.trick_number,
-                "Leader": f"P{t.leader}",
-                "Signal": t.signal.value or "—",
-                "Cards Played": plays_str,
-                "Winner": f"P{t.winner} (Team {team_of(t.winner)})",
-                "Points (thirds)": t.points_thirds,
-            }
-        )
-    st.dataframe(rows, use_container_width=True, hide_index=True)
+    # Sync slider state BEFORE instantiating the widget (prevents snap-back during auto-play)
+    st.session_state["watch_timeline_slider"] = w["step"]
 
-    st.download_button(
-        "Download Hand Log (JSON)",
-        data=json.dumps(res.to_dict(), indent=2, ensure_ascii=False),
-        file_name="openbecca_ai_hand.json",
-        mime="application/json",
+    # Playback controls — single fixed-key button for Play/Pause
+    b1, b2, b3, b4, b5 = st.columns([1, 1, 1, 1, 3])
+    b1.button(
+        "⏮ Reset",
+        use_container_width=True,
+        key="watch_reset_btn",
+        on_click=_watch_reset,
     )
+    b2.button(
+        "◀ Prev",
+        use_container_width=True,
+        disabled=w["step"] <= 0,
+        key="watch_prev_btn",
+        on_click=_watch_prev,
+    )
+    b3.button(
+        "⏸ Pause" if w["playing"] else "▶ Play",
+        type="primary",
+        use_container_width=True,
+        key="watch_play_toggle",
+        on_click=_watch_toggle_play,
+        args=(max_step,),
+    )
+    b4.button(
+        "Next ▶",
+        use_container_width=True,
+        disabled=w["step"] >= max_step,
+        key="watch_next_btn",
+        on_click=_watch_next,
+        args=(max_step,),
+    )
+    b5.slider(
+        "Timeline",
+        min_value=0,
+        max_value=max_step,
+        label_visibility="collapsed",
+        key="watch_timeline_slider",
+        on_change=_watch_on_slider_change,
+    )
+
+    seat_names = {
+        0: f"P0 · {w['team0']} (T0)",
+        1: f"P1 · {w['team1']} (T1)",
+        2: f"P2 · {w['team0']} (T0)",
+        3: f"P3 · {w['team1']} (T1)",
+    }
+
+    render_table_component(
+        hands=frame["hands"],
+        hand_visible={0: True, 1: True, 2: True, 3: True},
+        seat_names=seat_names,
+        legal_cards=[],
+        interactive=False,
+        active_player=frame["active_player"],
+        trick_plays=frame["trick_plays"],
+        trick_leader=frame["trick_leader"],
+        trick_signal=frame["trick_signal"],
+        trick_winner=frame["trick_winner"],
+        trump_suit=res.trump_suit,
+        trick_label=frame["trick_label"],
+        center_banner=frame["banner"],
+        turn_token=f"watch-{w['step']}",
+        key="watch_table",
+    )
+
+    with st.expander("Full Trick-by-Trick Table & JSON Export"):
+        rows = []
+        for t in res.tricks:
+            plays_str = " | ".join(
+                f"P{pl.player}: {card_display_name(pl.card)}" for pl in t.plays
+            )
+            rows.append(
+                {
+                    "Trick": t.trick_number,
+                    "Leader": f"P{t.leader}",
+                    "Signal": signal_label(t.signal),
+                    "Cards Played": plays_str,
+                    "Winner": f"P{t.winner} (Team {team_of(t.winner)})",
+                    "Thirds": t.points_thirds,
+                }
+            )
+        st.dataframe(rows, use_container_width=True, hide_index=True)
+        st.download_button(
+            "Download Hand Log (JSON)",
+            data=json.dumps(res.to_dict(), indent=2, ensure_ascii=False),
+            file_name="openbecca_ai_hand.json",
+            mime="application/json",
+        )
+
+    if w["playing"]:
+        if w["step"] < max_step:
+            time.sleep(max(0.05, bot_delay_ms / 1000.0))
+            w["step"] += 1
+            st.rerun()
+        else:
+            w["playing"] = False
+            st.rerun()
 
 
 # ======================================================================
@@ -964,10 +1458,10 @@ def render_studio_mode(checkpoint_path: str | None, rollout_weight: float) -> No
 
     c1, c2, c3, c4 = st.columns(4)
     trump_suit = c1.selectbox(
-        "Trump Suit", list(Suit), format_func=suit_badge, key="studio_trump"
+        "Briscola Suit", list(Suit), format_func=suit_badge, key="studio_trump"
     )
     player_id = c2.selectbox("Your Seat", [0, 1, 2, 3], index=0, key="studio_seat")
-    trump_caller = c3.selectbox("Trump Caller", [0, 1, 2, 3], index=0, key="studio_caller")
+    trump_caller = c3.selectbox("Briscola Caller", [0, 1, 2, 3], index=0, key="studio_caller")
     cricca_choice = c4.selectbox(
         "Cricca Declared By",
         ["None", "Player 0", "Player 1", "Player 2", "Player 3"],
@@ -986,6 +1480,14 @@ def render_studio_mode(checkpoint_path: str | None, rollout_weight: float) -> No
     )
     player_hand = [label_to_card[lbl] for lbl in selected_hand_labels]
 
+    if player_hand and count_downloaded_cards() > 0:
+        preview_cards = sort_hand_romagnole(player_hand)
+        pcols = st.columns(min(10, len(preview_cards)))
+        for idx, card in enumerate(preview_cards):
+            img_path = CARDS_DIR / f"{card_id(card)}.png"
+            if img_path.exists():
+                pcols[idx].image(str(img_path), caption=card_display_name(card), width=72)
+
     remaining_after_hand = [lbl for lbl in all_labels if lbl not in selected_hand_labels]
     table_labels = st.multiselect(
         "2. Cards Currently on the Table (0 to 3 cards, in order played)",
@@ -1002,7 +1504,7 @@ def render_studio_mode(checkpoint_path: str | None, rollout_weight: float) -> No
         lead_signal = st.selectbox(
             "Signal Announced by Trick Leader",
             signal_options,
-            format_func=lambda s: s.value if s.value else "(Silence)",
+            format_func=lambda s: s.value.lower() if s != Signal.NONE else "(silence)",
             key="studio_signal",
         )
 
@@ -1104,6 +1606,23 @@ def main() -> None:
         page_icon="🃏",
         layout="wide",
     )
+
+    # Prevent dimming ONLY on the card table iframe (never on Streamlit buttons)
+    st.markdown(
+        """
+        <style>
+          [data-testid="stCustomComponentV1"],
+          [data-testid="stCustomComponentV1"][data-stale="true"],
+          iframe[title="becca_table"] {
+            opacity: 1 !important;
+            filter: none !important;
+            transition: none !important;
+          }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
     st.sidebar.title("🃏 OpenBecca")
     st.sidebar.caption("Ravenna Beccacino Engine & AI Analyzer")
 
@@ -1114,6 +1633,17 @@ def main() -> None:
             "Watch 4 AI",
             "Stockfish Studio (Custom Setup)",
         ],
+    )
+
+    st.sidebar.divider()
+    st.sidebar.subheader("Bot Speed (Table)")
+    bot_delay_ms = st.sidebar.slider(
+        "Delay between bot plays (ms)",
+        min_value=50,
+        max_value=2000,
+        value=600,
+        step=50,
+        help="Delay in milliseconds between each bot's card play (Play & Watch 4 AI).",
     )
 
     st.sidebar.divider()
@@ -1139,10 +1669,17 @@ def main() -> None:
         rollout_weight = 1.0
         st.sidebar.warning("No checkpoints found in `checkpoints/`. Neural bots disabled.")
 
+    if count_downloaded_cards() < 40:
+        st.warning(
+            "Romagnole card deck not fully downloaded yet "
+            f"({count_downloaded_cards()}/40 found). Run:\n\n"
+            "`python scripts/download_romagnole.py`"
+        )
+
     if mode == "Play (1 Human + 3 AI)":
-        render_play_mode(checkpoint_path, rollout_weight)
+        render_play_mode(checkpoint_path, rollout_weight, bot_delay_ms)
     elif mode == "Watch 4 AI":
-        render_watch_mode(checkpoint_path, rollout_weight)
+        render_watch_mode(checkpoint_path, rollout_weight, bot_delay_ms)
     else:
         render_studio_mode(checkpoint_path, rollout_weight)
 
